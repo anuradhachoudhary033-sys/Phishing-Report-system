@@ -1,0 +1,78 @@
+# MASTER SYSTEM ARCHITECTURE PROMPT: END-TO-END MOBILE SOAR PHISHING PIPELINE
+
+## 1. Executive Summary & Goal
+You are building an enterprise-grade, lightweight Security Orchestration, Automation, and Response (SOAR) phishing detection system. The system consists of two primary components:
+1. **A Lightweight Mobile Client (iOS & Android):** Acts as a real-time sensor and enforcement point using a high-performance C++ core bound to a Flutter frontend via Dart FFI.
+2. **A Python Orchestration Backend:** Handles deep learning inference, automated VM/container sandboxing, dynamic threat detonation, and law-enforcement-compliant report generation.
+
+Target Constraints: Mobile app release binary < 15MB; Memory usage < 25MB RAM; Threat detection latency < 15ms locally.
+
+---
+
+## 2. Component Specifications & Tech Stack
+
+### A. Mobile Client Engine (C++17 & Flutter)
+* **Frontend:** Flutter (Dart), restricted to minimal core widgets, custom painters, and `ValueNotifier` for zero-bloat state management.
+* **Network Interception Layer:** A local `VpnService` (Android) and `NEPacketTunnelProvider` (iOS) loop that pipes packet headers to the C++ core.
+* **C++ Core Engine (`libsoar_core`):**
+  * **Feature Extractor:** High-speed string parsing, URL entropy calculation, domain age checks, and typosquatting detection in C++.
+  * **Memory Optimization:** Uses Counting Bloom Filters for local IOC (Indicator of Compromise) matching, allowing 100k+ malicious domains to fit in < 500KB of RAM.
+  * **Bridge:** Interfaced directly to Dart via `dart:ffi`. Zero JSON serialization overhead—data is passed as raw C struct pointers.
+
+### B. Python Backend (FastAPI, PyTorch, Playwright, Docker)
+* **Layer 1 Triage API:** FastAPI endpoint accepting telemetry from edge clients. Uses an ONNX-quantized Transformer model (e.g., MiniLM) to evaluate text/header risk scores.
+* **Layer 2 Dynamic Sandbox:** 
+  * Spawns headless Playwright instances in isolated Docker containers to detonate suspicious URLs ($0.50 < P(\text{phishing}) < 0.95$).
+  * Performs visual brand spoofing detection using lightweight computer vision (perceptual hashing / CNNs) against brand logo baselines.
+  * Captures network traffic, extracts final redirect destination, payload SHA-256 hashes, and Command & Control (C2) server IPs.
+* **Layer 3 Reporting Engine:**
+  * Aggregates threat intelligence when a campaign threshold is met (e.g., > 20 instances across the network).
+  * Generates structured incident reports matching legal specifications for national cyber portals (e.g., CERT-In JSON schema, I4C FIR drafts).
+  * Maps all observed tactics to the MITRE ATT&CK matrix (e.g., T1566.002 - Spearphishing Link).
+
+---
+
+## 3. End-to-End System Workflow
+
+### Step 1: Real-Time Edge Triage (Tier 1)
+1. The Mobile App intercepts incoming web requests/DNS queries through its local VPN loop.
+2. The C++ engine extracts structural features and checks the local Bloom Filter:
+   * **If Match (Score > 0.95):** The request is blocked instantly at the edge. A local push notification alerts the user. An anonymized IOC hash is broadcast to update the peer network.
+   * **If Suspicious (0.50 < Score < 0.95):** The payload metadata is encrypted (mTLS) and forwarded to the Python Backend.
+
+### Step 2: Automated Sandboxing & Detonation (Tier 2)
+1. The Python Backend receives the suspicious payload and queues it for detonation.
+2. The headless browser opens the URL inside an isolated ephemeral Docker container, executing JavaScript and following all HTTP redirects.
+3. If dynamic analysis uncovers a fake login portal or malware download, the backend extracts the root C2 server IP and generates a new signed IOC update.
+4. The new IOC is pushed to all active mobile clients to immediately update their C++ Bloom Filters.
+
+### Step 3: Forensic Aggregation & Legal Escalation (Tier 3)
+1. When a specific C2 IP or domain trigger crosses a defined threshold, the backend compiles a full forensic evidence package:
+   - Complete HTTP request/response chain and headers.
+   - Screenshots of rendered phishing portals.
+   - SHA-256 hashes of downloaded binaries.
+   - Reverse DNS / WHOIS records and C2 IP coordinates.
+   - MITRE ATT&CK classification mappings.
+2. The report is auto-formatted into a CERT-In compliant JSON object and a human-readable PDF.
+3. The dashboard alerts an authorized security analyst with a single-click button to submit the report directly to official cyber cell endpoints via secure API/email protocols.
+
+---
+
+## 4. Initial Deliverables & Implementation Roadmap
+
+1. **Scaffold Directory Structure:**
+   - `/mobile_client`: Flutter project setup with `android`, `ios`, and `native_core/cpp` directories.
+   - `/backend_server`: Python FastAPI project containing `/models`, `/sandbox`, and `/reporting` modules.
+   - `/shared_schemas`: Protocol buffers or C struct definitions for unified data types.
+
+2. **C++ Native Core Scaffolding:**
+   - Write `soar_core.h` and `soar_core.cpp` implementing the Bloom Filter and URL feature extractor.
+   - Set up `CMakeLists.txt` for cross-compiling to `.so` (Android) and `.dylib` / `.xcframework` (iOS).
+   - Create the `dart:ffi` binding bridge in Flutter.
+
+3. **Python Backend Scaffolding:**
+   - Create FastAPI endpoints for `/api/v1/triage` and `/api/v1/detonate`.
+   - Implement the Playwright sandbox runner script inside Docker.
+   - Write the CERT-In JSON report generator class.
+
+Confirm understanding of this architecture and begin by generating the directory scaffolding and the C++ native core headers.

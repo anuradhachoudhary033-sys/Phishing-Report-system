@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+pydantic
+websockets
+playwright
+Pillow
+imagehash
+reportlab
+python-Levenshtein
+onnxruntime
+aiosqlite

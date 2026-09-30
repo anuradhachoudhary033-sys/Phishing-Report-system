@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>SOAR Pipeline — Phishing Detection Prototype</title>
+  <meta name="description" content="Mobile SOAR Phishing Pipeline — Ultra-lightweight real-time phishing detection client prototype">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/icon?family=Material+Icons+Round" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app" class="app-shell">
+    <!-- ═══════════════════════ TRIAGE SCREEN ═══════════════════════ -->
+    <div id="screen-triage" class="screen active">
+      <div class="screen-header">
+        <div class="header-icon gradient-cyan">
+          <span class="material-icons-round">shield</span>
+        </div>
+        <div class="header-text">
+          <h1>Triage Dashboard</h1>
+          <p>Real-time phishing intercept</p>
+        </div>
+      </div>
+
+      <div class="stats-row" id="triage-stats">
+        <div class="glass-card stat-card">
+          <span class="stat-label">BLOCKED</span>
+          <span class="stat-value cyan" id="stat-blocked">0</span>
+        </div>
+        <div class="glass-card stat-card">
+          <span class="stat-label">PHISHING</span>
+          <span class="stat-value danger" id="stat-phishing">0</span>
+        </div>
+        <div class="glass-card stat-card">
+          <span class="stat-label">RATE</span>
+          <span class="stat-value warning" id="stat-rate">—</span>
+        </div>
+      </div>
+
+      <div class="section-header">
+        <span class="section-title">MANUAL TRIAGE</span>
+      </div>
+      <div class="triage-input-container">
+        <form id="triage-form" class="triage-form">
+          <input type="url" id="triage-url-input" class="glass-input" placeholder="Enter URL to analyze..." required>
+          <button type="submit" class="soar-btn soar-btn-cyan submit-btn">
+            <span class="material-icons-round">radar</span>
+          </button>
+        </form>
+      </div>
+
+      <div class="section-header">
+        <span class="section-title">LIVE FEED</span>
+        <div class="status-indicator">
+          <div class="pulse-dot demo-dot" id="connection-dot"></div>
+          <span class="status-text warning-text" id="connection-status">DISCONNECTED</span>
+        </div>
+      </div>
+
+      <div class="event-list" id="triage-feed">
+        <div class="empty-state">
+          <span class="material-icons-round empty-icon">wifi_tethering</span>
+          <p>Awaiting events…</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════════════════════ ALERTS SCREEN ═══════════════════════ -->
+    <div id="screen-alerts" class="screen">
+      <div class="screen-header">
+        <div class="header-icon gradient-warning">
+          <span class="material-icons-round">bug_report</span>
+        </div>
+        <div class="header-text">
+          <h1>Dynamic Analysis</h1>
+          <p>Sandbox detonation alerts</p>
+        </div>
+      </div>
+
+      <div class="stats-row" id="alerts-stats">
+        <div class="glass-card stat-card stat-card-mini">
+          <div class="stat-mini-row">
+            <span class="material-icons-round danger-icon">dangerous</span>
+            <div>
+              <span class="stat-value-sm danger" id="stat-malicious">0</span>
+              <span class="stat-label-sm">Malicious</span>
+            </div>
+          </div>
+        </div>
+        <div class="glass-card stat-card stat-card-mini">
+          <div class="stat-mini-row">
+            <span class="material-icons-round warning-icon">warning</span>
+            <div>
+              <span class="stat-value-sm warning" id="stat-suspicious">0</span>
+              <span class="stat-label-sm">Suspicious</span>
+            </div>
+          </div>
+        </div>
+        <div class="glass-card stat-card stat-card-mini">
+          <div class="stat-mini-row">
+            <span class="material-icons-round success-icon">check_circle</span>
+            <div>
+              <span class="stat-value-sm success" id="stat-clean">0</span>
+              <span class="stat-label-sm">Clean</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section-header">
+        <span class="section-title">SANDBOX RESULTS</span>
+      </div>
+
+      <div class="event-list" id="alerts-feed">
+        <div class="empty-state">
+          <span class="material-icons-round empty-icon">hourglass_empty</span>
+          <p>No detonation results yet…</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════════════════════ REPORTS SCREEN ═══════════════════════ -->
+    <div id="screen-reports" class="screen">
+      <div class="screen-header">
+        <div class="header-icon gradient-success">
+          <span class="material-icons-round">description</span>
+        </div>
+        <div class="header-text">
+          <h1>Escalation</h1>
+          <p>CERT-In intelligence reports</p>
+        </div>
+      </div>
+
+      <div class="section-header">
+        <span class="section-title">INTELLIGENCE REPORTS</span>
+      </div>
+
+      <div class="event-list" id="reports-feed"></div>
+    </div>
+
+    <!-- ═══════════════════════ EMAIL SCREEN ═══════════════════════ -->
+    <div id="screen-email" class="screen">
+      <div class="screen-header">
+        <div class="header-icon gradient-danger">
+          <span class="material-icons-round">email</span>
+        </div>
+        <div class="header-text">
+          <h1>Email Scanner</h1>
+          <p>Phishing email detection</p>
+        </div>
+      </div>
+
+      <div class="section-header">
+        <span class="section-title">SCAN EMAIL</span>
+      </div>
+
+      <div class="event-list" id="email-content">
+        <div class="email-form-container">
+          <form id="email-scan-form">
+            <div class="form-group">
+              <label class="form-label">Sender Email</label>
+              <input type="email" id="email-sender" class="glass-input full" placeholder="noreply@paypa1-secure.net" required>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Display Name</label>
+              <input type="text" id="email-display-name" class="glass-input full" placeholder="PayPal Security Team">
+            </div>
+            <div class="form-group">
+              <label class="form-label">Subject</label>
+              <input type="text" id="email-subject" class="glass-input full" placeholder="Your account has been suspended" required>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Email Body</label>
+              <textarea id="email-body" class="glass-input full glass-textarea" rows="4" placeholder="Dear Customer, We have detected unauthorized access to your account. Click here to verify your identity immediately or your account will be permanently locked..."></textarea>
+            </div>
+            <div class="form-group">
+              <label class="form-label">URLs in Email (one per line)</label>
+              <textarea id="email-urls" class="glass-input full glass-textarea" rows="2" placeholder="https://paypa1-secure.net/verify-account"></textarea>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Attachment Names (comma separated)</label>
+              <input type="text" id="email-attachments" class="glass-input full" placeholder="invoice.pdf, receipt.exe">
+            </div>
+            <button type="submit" class="soar-btn soar-btn-cyan" id="email-scan-btn" style="width:100%;margin-top:12px">
+              <span class="material-icons-round">security</span>
+              Analyze Email
+            </button>
+          </form>
+        </div>
+
+        <!-- Results appear here -->
+        <div id="email-results"></div>
+      </div>
+    </div>
+
+    <!-- ═══════════════════════ BOTTOM NAV ═══════════════════════ -->
+    <nav class="bottom-nav">
+      <button class="nav-btn active" data-screen="triage" id="nav-triage">
+        <span class="material-icons-round">shield</span>
+        <span class="nav-label">Triage</span>
+      </button>
+      <button class="nav-btn" data-screen="alerts" id="nav-alerts">
+        <span class="material-icons-round">bug_report</span>
+        <span class="nav-label">Alerts</span>
+      </button>
+      <button class="nav-btn" data-screen="reports" id="nav-reports">
+        <span class="material-icons-round">description</span>
+        <span class="nav-label">Reports</span>
+      </button>
+      <button class="nav-btn" data-screen="email" id="nav-email">
+        <span class="material-icons-round">email</span>
+        <span class="nav-label">Email</span>
+      </button>
+    </nav>
+  </div>
+
+  <!-- ═══════════════════════ SNACKBAR ═══════════════════════ -->
+  <div id="snackbar" class="snackbar hidden"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

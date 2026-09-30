@@ -1,0 +1,14 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "IOC Update",
+  "type": "object",
+  "properties": {
+    "url": {
+      "type": "string"
+    },
+    "risk_score": {
+      "type": "number"
+    }
+  },
+  "required": ["url", "risk_score"]
+}
