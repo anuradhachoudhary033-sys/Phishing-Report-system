@@ -10,6 +10,7 @@ import 'theme/soar_theme.dart';
 import 'screens/dashboard_screen.dart';
 import 'screens/alerts_screen.dart';
 import 'screens/reporting_screen.dart';
+import 'screens/gmail_screen.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -55,6 +56,7 @@ class _SoarShellState extends State<SoarShell> {
     DashboardScreen(),
     AlertsScreen(),
     ReportingScreen(),
+    GmailScreen(),
   ];
 
   @override
@@ -85,6 +87,11 @@ class _SoarShellState extends State<SoarShell> {
               icon: Icon(Icons.description_outlined),
               activeIcon: Icon(Icons.description),
               label: 'Reports',
+            ),
+            BottomNavigationBarItem(
+              icon: Icon(Icons.mark_email_unread_outlined),
+              activeIcon: Icon(Icons.mark_email_read_rounded),
+              label: 'Gmail',
             ),
           ],
         ),

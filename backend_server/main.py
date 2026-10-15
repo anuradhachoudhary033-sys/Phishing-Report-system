@@ -11,6 +11,7 @@ Full API server with:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -44,6 +45,10 @@ from campaign_db import (
     mark_report_generated,
     record_incident,
 )
+from gmail.oauth_routes import router as gmail_oauth_router
+from gmail.webhook_handler import router as gmail_webhook_router
+from gmail.user_store import init_gmail_db, prune_old_messages
+from gmail.watch_renewal import renew_all_watches
 
 # ── Logging ──────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -99,7 +104,12 @@ async def lifespan(app: FastAPI):
     # Ensure campaign DB is initialized
     from campaign_db import _ensure_db
     await _ensure_db()
+    # Initialize Gmail user store
+    await init_gmail_db()
+    # Launch the daily watch-renewal background loop
+    renewal_task = asyncio.create_task(_daily_watch_renewal_loop())
     yield
+    renewal_task.cancel()
     logger.info("SOAR engine shutting down")
 
 
@@ -110,7 +120,11 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# ── CORS (allow prototype UI to reach API) ────────────
+# ── Register Gmail routers ──────────────────────────────────────────────
+app.include_router(gmail_oauth_router)
+app.include_router(gmail_webhook_router)
+
+# ── CORS (allow prototype UI + ngrok tunnel to reach API) ────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -119,12 +133,11 @@ app.add_middleware(
         "http://localhost:5000",
         "http://127.0.0.1:5000",
     ],
+    allow_origin_regex=r"https://.*\.(ngrok-free\.app|ngrok-free\.dev|loca\.lt|run\.app|onrender\.com|hf\.space)",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
 # ── Layer 1: Triage API ─────────────────────────────────────────────────
 
 @app.post("/api/v1/triage")
@@ -449,6 +462,40 @@ async def triage_websocket(ws: WebSocket):
 
     except WebSocketDisconnect:
         manager.disconnect(ws)
+
+
+# ── Gmail Admin ──────────────────────────────────────────────────────────
+
+@app.post("/admin/gmail/renew-watches")
+async def admin_renew_watches():
+    """Manually trigger watch renewal for all registered Gmail users."""
+    result = await renew_all_watches()
+    return result
+
+
+@app.post("/admin/gmail/prune-messages")
+async def admin_prune_messages(keep_days: int = 7):
+    """Purge old processed-message records to keep the DB lean."""
+    count = await prune_old_messages(keep_days)
+    return {"pruned": count, "keep_days": keep_days}
+
+
+async def _daily_watch_renewal_loop():
+    """
+    Background coroutine that renews all Gmail watches once every 24 hours
+    and prunes stale message IDs. Runs for the lifetime of the server.
+    """
+    while True:
+        try:
+            await asyncio.sleep(24 * 60 * 60)  # 24 hours
+            logger.info("Running scheduled Gmail watch renewal")
+            await renew_all_watches()
+            pruned = await prune_old_messages(keep_days=7)
+            logger.info("Pruned %d old processed-message records", pruned)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error("Watch renewal loop error: %s", e)
 
 
 # ── Health Check ─────────────────────────────────────────────────────────

@@ -25,7 +25,7 @@ BASELINES_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Server ───────────────────────────────────────────────────────────────
 HOST = os.getenv("SOAR_HOST", "0.0.0.0")
-PORT = int(os.getenv("SOAR_PORT", "8000"))
+PORT = int(os.getenv("PORT", os.getenv("SOAR_PORT", "8000")))
 
 # ── Triage Thresholds ────────────────────────────────────────────────────
 BLOCK_THRESHOLD = 0.95      # Score > this → instant block at edge
@@ -43,6 +43,22 @@ BRAND_HASH_THRESHOLD = 12
 
 # ── Campaign Aggregation ────────────────────────────────────────────────
 CAMPAIGN_REPORT_THRESHOLD = 20  # Instances before auto-generating CERT-In report
+
+# ── Gmail OAuth / Pub/Sub ────────────────────────────────────────────────
+GMAIL_CLIENT_SECRETS_FILE = os.getenv(
+    "GMAIL_CLIENT_SECRETS", str(BASE_DIR / "client_secret.json")
+)
+# gmail.modify allows auto-labeling detected phishing emails in the user's mailbox
+GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
+# ⚠️ REPLACE with your actual GCP project ID after creating the Pub/Sub topic
+GMAIL_PUBSUB_TOPIC = os.getenv(
+    "GMAIL_PUBSUB_TOPIC",
+    "projects/anti-phishingml/topics/gmail-phishing-alerts",
+)
+
+# Allow HTTP for local OAuth testing (remove in production with HTTPS)
+if os.getenv("OAUTHLIB_INSECURE_TRANSPORT") is None:
+    os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 
 # ── Top 30 Phishing Targets (bounded Levenshtein whitelist) ──────────────
 # Restricted to avoid O(m*n) explosion on every triage request
