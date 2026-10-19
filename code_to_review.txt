@@ -1,0 +1,1324 @@
+﻿=== FILE: backend_server\main.py ===
+"""
+SOAR Phishing Orchestrator Engine â€” FastAPI Application
+
+Full API server with:
+- Layer 1: ML-powered triage scoring (/api/v1/triage)
+- Layer 2: Async sandbox detonation (/api/v1/detonate)
+- Layer 3: CERT-In report generation and PDF download (/api/v1/reports)
+- WebSocket: Live event streaming to Flutter clients (/ws/triage)
+- Campaign tracking: SQLite-persisted incident aggregation
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from uuid import uuid4
+
+from fastapi import BackgroundTasks, FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+
+from config import CAMPAIGN_REPORT_THRESHOLD
+from models import (
+    DetonationRequest,
+    EmailScanPayload,
+    IntelReport,
+    PhishingEvent,
+    TriagePayload,
+)
+from models.email_analyzer import analyze_email, extract_urls_from_email
+from models.feature_extractor import extract_domain
+from models.triage_scorer import score_url
+from sandbox.docker_runner import run_sandbox
+from reporting import create_intel_report, generate_certin_json, save_report
+from reporting.mitre_mapper import map_techniques
+from reporting.pdf_builder import build_pdf
+from campaign_db import (
+    get_all_campaigns,
+    get_campaign_stats,
+    log_detonation,
+    mark_report_generated,
+    record_incident,
+)
+from gmail.oauth_routes import router as gmail_oauth_router
+from gmail.webhook_handler import router as gmail_webhook_router
+from gmail.user_store import init_gmail_db, prune_old_messages
+from gmail.watch_renewal import renew_all_watches
+
+# â”€â”€ Logging â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s â”‚ %(name)-18s â”‚ %(levelname)-7s â”‚ %(message)s",
+)
+logger = logging.getLogger("soar.api")
+
+
+# â”€â”€ WebSocket Connection Manager â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class ConnectionManager:
+    """Manages active WebSocket connections for live event broadcasting."""
+
+    def __init__(self):
+        self._connections: list[WebSocket] = []
+
+    async def connect(self, ws: WebSocket):
+        await ws.accept()
+        self._connections.append(ws)
+        logger.info("Client connected (%d total)", len(self._connections))
+
+    def disconnect(self, ws: WebSocket):
+        self._connections.remove(ws)
+        logger.info("Client disconnected (%d remaining)", len(self._connections))
+
+    async def broadcast(self, event: PhishingEvent):
+        """Broadcast a phishing event to all connected clients."""
+        data = event.model_dump_json()
+        dead: list[WebSocket] = []
+        for ws in self._connections:
+            try:
+                await ws.send_text(data)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self._connections.remove(ws)
+
+    @property
+    def active_count(self) -> int:
+        return len(self._connections)
+
+
+manager = ConnectionManager()
+
+
+# â”€â”€ App Lifecycle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup / shutdown lifecycle for the SOAR API."""
+    logger.info("SOAR Phishing Orchestrator Engine starting up")
+    # Ensure campaign DB is initialized
+    from campaign_db import _ensure_db
+    await _ensure_db()
+    # Initialize Gmail user store
+    await init_gmail_db()
+    # Launch the daily watch-renewal background loop
+    renewal_task = asyncio.create_task(_daily_watch_renewal_loop())
+    yield
+    renewal_task.cancel()
+    logger.info("SOAR engine shutting down")
+
+
+app = FastAPI(
+    title="SOAR Phishing Orchestrator Engine",
+    version="1.0.0",
+    description="Enterprise-grade phishing detection SOAR pipeline",
+    lifespan=lifespan,
+)
+
+# â”€â”€ Register Gmail routers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+app.include_router(gmail_oauth_router)
+app.include_router(gmail_webhook_router)
+
+# â”€â”€ CORS (allow prototype UI + ngrok tunnel to reach API) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5000",
+        "http://127.0.0.1:5000",
+    ],
+    allow_origin_regex=r"https://.*\.(ngrok-free\.app|ngrok-free\.dev|loca\.lt|run\.app|onrender\.com|hf\.space)",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+# â”€â”€ Layer 1: Triage API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+@app.post("/api/v1/triage")
+async def process_triage(payload: TriagePayload, background_tasks: BackgroundTasks):
+    """
+    Score a URL using the ML triage pipeline.
+
+    Returns the risk score, action (BLOCK_INSTANT / QUEUE_SANDBOX / ALLOW),
+    and extracted features. If the action is QUEUE_SANDBOX, the detonation
+    is automatically queued as a background task.
+    """
+    result = await score_url(payload)
+
+    # Record incident in campaign tracker
+    domain = extract_domain(payload.url)
+    if domain:
+        background_tasks.add_task(
+            record_incident, domain, payload.source_ip
+        )
+
+    # Broadcast to connected WebSocket clients
+    event = PhishingEvent(
+        id=f"evt-{uuid4().hex[:12]}",
+        url=payload.url,
+        risk_score=result.risk_score,
+        is_phishing=result.is_phishing,
+        bloom_match_count=result.bloom_match_count,
+        source_ip=payload.source_ip,
+        peer_node=payload.peer_node,
+    )
+    background_tasks.add_task(manager.broadcast, event)
+
+    # Auto-queue sandbox if in the suspicious range
+    if result.action == "QUEUE_SANDBOX":
+        det_request = DetonationRequest(
+            url=payload.url,
+            triage_score=result.risk_score,
+            source_ip=payload.source_ip,
+            peer_node=payload.peer_node,
+        )
+        background_tasks.add_task(_run_detonation_pipeline, det_request)
+
+    return result.model_dump()
+
+
+# â”€â”€ Layer 2: Sandbox API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+@app.post("/api/v1/detonate")
+async def trigger_detonation(request: DetonationRequest, background_tasks: BackgroundTasks):
+    """
+    Manually trigger sandbox detonation for a URL.
+
+    The detonation runs as a background task to avoid blocking.
+    """
+    background_tasks.add_task(_run_detonation_pipeline, request)
+    return {"status": "detonation_queued", "target": request.url}
+
+
+async def _run_detonation_pipeline(request: DetonationRequest):
+    """
+    Full detonation pipeline:
+    1. Run sandbox (async Playwright)
+    2. Log result to campaign DB
+    3. Check campaign threshold for auto-report generation
+    4. Broadcast IOC update to clients
+    """
+    try:
+        result = await run_sandbox(request)
+        domain = extract_domain(request.url)
+
+        # Log detonation
+        await log_detonation(
+            url=request.url,
+            domain=domain,
+            verdict=result.verdict,
+            confidence=result.confidence_score,
+            brand_match=result.brand_match,
+            screenshot_path=result.screenshot_path,
+        )
+
+        # Record incident and check threshold
+        if domain:
+            count, threshold_crossed = await record_incident(domain)
+
+            if threshold_crossed:
+                logger.info(
+                    "Campaign threshold crossed for '%s' (%d incidents) â€” generating CERT-In report",
+                    domain, count,
+                )
+                # Auto-generate report
+                techniques = map_techniques(
+                    detonation=result,
+                    has_typosquat=False,  # Could be enriched from triage features
+                )
+                report = create_intel_report(
+                    campaign_domain=domain,
+                    campaign_ip=result.external_ips[0] if result.external_ips else "",
+                    incident_count=count,
+                    detonation_results=[result],
+                    mitre_techniques=techniques,
+                )
+                # Build PDF
+                report_data = generate_certin_json(
+                    campaign_domain=domain,
+                    campaign_ip=result.external_ips[0] if result.external_ips else "",
+                    incident_count=count,
+                    detonation_results=[result],
+                    mitre_techniques=techniques,
+                )
+                build_pdf(report_data)
+                await mark_report_generated(domain)
+                logger.info("Auto-generated report %s for campaign '%s'", report.report_id, domain)
+
+        # Broadcast as phishing event
+        if result.verdict in ("malicious", "suspicious"):
+            event = PhishingEvent(
+                id=f"det-{uuid4().hex[:12]}",
+                url=request.url,
+                risk_score=result.confidence_score,
+                is_phishing=True,
+                source_ip=request.source_ip,
+                peer_node=request.peer_node,
+            )
+            await manager.broadcast(event)
+
+    except Exception as e:
+        logger.error("Detonation pipeline failed for %s: %s", request.url, e)
+
+
+# â”€â”€ Layer 3: Reporting API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+@app.get("/api/v1/reports")
+async def list_reports():
+    """List all generated intelligence reports."""
+    reports_dir = Path("reporting/generated")
+    if not reports_dir.exists():
+        return []
+
+    reports = []
+    for json_file in sorted(reports_dir.glob("*.json"), reverse=True):
+        try:
+            data = json.loads(json_file.read_text())
+            reports.append({
+                "report_id": data["metadata"]["report_id"],
+                "cert_in_ref_no": data["metadata"]["cert_in_ref_no"],
+                "status": "generated",
+                "generated_at": data["metadata"]["generated_at"],
+                "download_url": f"/api/v1/reports/{data['metadata']['report_id']}/pdf",
+            })
+        except Exception:
+            continue
+
+    return reports
+
+
+@app.get("/api/v1/reports/{report_id}/pdf")
+async def download_report_pdf(report_id: str):
+    """Download a report as PDF."""
+    pdf_path = Path(f"reporting/generated/{report_id}.pdf")
+    if not pdf_path.exists():
+        # Try to build from JSON
+        json_path = Path(f"reporting/generated/{report_id}.json")
+        if json_path.exists():
+            report_data = json.loads(json_path.read_text())
+            pdf_path = build_pdf(report_data)
+        else:
+            return JSONResponse(
+                {"error": "Report not found"},
+                status_code=404,
+            )
+
+    return FileResponse(
+        str(pdf_path),
+        media_type="application/pdf",
+        filename=f"{report_id}.pdf",
+    )
+
+
+@app.post("/api/v1/reports/{report_id}/submit")
+async def submit_report(report_id: str):
+    """
+    Submit an intelligence package to CERT-In.
+    (Mocked for initial implementation â€” would integrate with
+    official CERT-In API or secure email relay in production.)
+    """
+    json_path = Path(f"reporting/generated/{report_id}.json")
+    if not json_path.exists():
+        return JSONResponse(
+            {"error": "Report not found"},
+            status_code=404,
+        )
+
+    # In production, this would POST to CERT-In's API
+    logger.info("Intelligence package %s submitted to CERT-In (mocked)", report_id)
+
+    return {
+        "status": "submitted",
+        "report_id": report_id,
+        "message": "Intelligence package submitted to CERT-In portal",
+    }
+
+
+@app.post("/api/v1/reports/generate")
+async def manually_generate_report(domain: str, ip: str = ""):
+    """
+    Manually trigger a CERT-In report for a specific domain.
+    """
+    stats = await get_campaign_stats(domain)
+    incident_count = stats["incident_count"] if stats else 1
+
+    techniques = map_techniques(has_typosquat=False)
+    report_data = generate_certin_json(
+        campaign_domain=domain,
+        campaign_ip=ip,
+        incident_count=incident_count,
+        detonation_results=[],
+        mitre_techniques=techniques,
+    )
+    save_report(report_data)
+    pdf_path = build_pdf(report_data)
+
+    return {
+        "status": "generated",
+        "report_id": report_data["metadata"]["report_id"],
+        "cert_in_ref_no": report_data["metadata"]["cert_in_ref_no"],
+        "pdf_path": str(pdf_path),
+    }
+
+
+# â”€â”€ Email Scanning API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+@app.post("/api/v1/scan/email")
+async def scan_email(payload: EmailScanPayload, background_tasks: BackgroundTasks):
+    """
+    Scan an email for phishing indicators.
+
+    Analyzes sender spoofing, urgency keywords, hidden link mismatches,
+    dangerous attachments, and triages all embedded URLs through the
+    ML scoring pipeline.
+    """
+    result = await analyze_email(payload)
+
+    # If phishing detected, broadcast alert and record incidents
+    if result.verdict in ("phishing", "suspicious"):
+        # Record incidents for each malicious URL's domain
+        for url, score in result.url_scores.items():
+            if score > 0.4:
+                domain = extract_domain(url)
+                if domain:
+                    background_tasks.add_task(record_incident, domain, "email-scanner")
+
+        # Broadcast as a phishing event
+        event = PhishingEvent(
+            id=f"email-{uuid4().hex[:12]}",
+            url=f"email://{payload.sender_email}",
+            risk_score=result.confidence,
+            is_phishing=result.verdict == "phishing",
+            source_ip="email-scanner",
+            peer_node="gmail-oauth",
+        )
+        background_tasks.add_task(manager.broadcast, event)
+
+    return result.model_dump()
+
+
+# â”€â”€ Campaign Tracking API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+@app.get("/api/v1/campaigns")
+async def list_campaigns():
+    """List all tracked phishing campaigns with incident counts."""
+    return await get_all_campaigns()
+
+
+@app.get("/api/v1/campaigns/{domain}")
+async def get_campaign(domain: str):
+    """Get details for a specific campaign domain."""
+    stats = await get_campaign_stats(domain)
+    if stats:
+        return stats
+    return JSONResponse({"error": "Campaign not found"}, status_code=404)
+
+
+# â”€â”€ WebSocket: Live Triage Feed â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+@app.websocket("/ws/triage")
+async def triage_websocket(ws: WebSocket):
+    """
+    WebSocket endpoint for streaming live phishing events
+    to connected Flutter mobile clients.
+
+    Clients can also send triage payloads via the WebSocket
+    for inline scoring.
+    """
+    await manager.connect(ws)
+    try:
+        while True:
+            # Accept incoming messages (triage requests from clients)
+            data = await ws.receive_text()
+            try:
+                payload = TriagePayload.model_validate_json(data)
+                result = await score_url(payload)
+
+                # Record incident
+                domain = extract_domain(payload.url)
+                if domain:
+                    await record_incident(domain, payload.source_ip)
+
+                # Build event and broadcast
+                event = PhishingEvent(
+                    id=f"ws-{uuid4().hex[:12]}",
+                    url=payload.url,
+                    risk_score=result.risk_score,
+                    is_phishing=result.is_phishing,
+                    bloom_match_count=result.bloom_match_count,
+                    source_ip=payload.source_ip,
+                    peer_node=payload.peer_node,
+                )
+                await manager.broadcast(event)
+
+            except Exception as e:
+                await ws.send_json({"error": str(e)})
+
+    except WebSocketDisconnect:
+        manager.disconnect(ws)
+
+
+# â”€â”€ Gmail Admin â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+@app.post("/admin/gmail/renew-watches")
+async def admin_renew_watches():
+    """Manually trigger watch renewal for all registered Gmail users."""
+    result = await renew_all_watches()
+    return result
+
+
+@app.post("/admin/gmail/prune-messages")
+async def admin_prune_messages(keep_days: int = 7):
+    """Purge old processed-message records to keep the DB lean."""
+    count = await prune_old_messages(keep_days)
+    return {"pruned": count, "keep_days": keep_days}
+
+
+async def _daily_watch_renewal_loop():
+    """
+    Background coroutine that renews all Gmail watches once every 24 hours
+    and prunes stale message IDs. Runs for the lifetime of the server.
+    """
+    while True:
+        try:
+            await asyncio.sleep(24 * 60 * 60)  # 24 hours
+            logger.info("Running scheduled Gmail watch renewal")
+            await renew_all_watches()
+            pruned = await prune_old_messages(keep_days=7)
+            logger.info("Pruned %d old processed-message records", pruned)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error("Watch renewal loop error: %s", e)
+
+
+# â”€â”€ Health Check â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    return {
+        "status": "healthy",
+        "active_connections": manager.active_count,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+
+
+=== FILE: backend_server\config.py ===
+"""
+SOAR Backend â€” Centralized Configuration
+
+All tunable parameters in one place. Environment variables
+override defaults when set.
+"""
+
+import os
+from pathlib import Path
+
+# â”€â”€ Paths â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+BASE_DIR = Path(__file__).resolve().parent
+MODELS_DIR = BASE_DIR / "models"
+WEIGHTS_DIR = MODELS_DIR / "weights"
+SANDBOX_DIR = BASE_DIR / "sandbox"
+BASELINES_DIR = SANDBOX_DIR / "baselines"
+REPORTING_DIR = BASE_DIR / "reporting"
+QUARANTINE_DIR = BASE_DIR / "quarantine"  # Isolated download folder
+DB_PATH = BASE_DIR / "campaign.db"
+
+# Ensure critical directories exist
+QUARANTINE_DIR.mkdir(exist_ok=True)
+WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
+BASELINES_DIR.mkdir(parents=True, exist_ok=True)
+
+# â”€â”€ Server â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+HOST = os.getenv("SOAR_HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", os.getenv("SOAR_PORT", "8000")))
+
+# â”€â”€ Triage Thresholds â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+BLOCK_THRESHOLD = 0.95      # Score > this â†’ instant block at edge
+SANDBOX_THRESHOLD = 0.50    # Score > this but < BLOCK â†’ forward to sandbox
+ONNX_MODEL_PATH = WEIGHTS_DIR / "phishing_minilm.onnx"
+
+# â”€â”€ Sandbox â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+SANDBOX_TIMEOUT_MS = 30_000          # Max page load time
+SANDBOX_USE_DOCKER = os.getenv("SOAR_USE_DOCKER", "false").lower() == "true"
+DOCKER_IMAGE = "mcr.microsoft.com/playwright:v1.48.0-jammy"
+
+# â”€â”€ Brand Detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Hamming distance threshold: lower = stricter match
+BRAND_HASH_THRESHOLD = 12
+
+# â”€â”€ Campaign Aggregation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+CAMPAIGN_REPORT_THRESHOLD = 20  # Instances before auto-generating CERT-In report
+
+# â”€â”€ Gmail OAuth / Pub/Sub â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+GMAIL_CLIENT_SECRETS_FILE = os.getenv(
+    "GMAIL_CLIENT_SECRETS", str(BASE_DIR / "client_secret.json")
+)
+# gmail.modify allows auto-labeling detected phishing emails in the user's mailbox
+GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
+# âš ï¸ REPLACE with your actual GCP project ID after creating the Pub/Sub topic
+GMAIL_PUBSUB_TOPIC = os.getenv(
+    "GMAIL_PUBSUB_TOPIC",
+    "projects/anti-phishingml/topics/gmail-phishing-alerts",
+)
+
+# Allow HTTP for local OAuth testing (remove in production with HTTPS)
+if os.getenv("OAUTHLIB_INSECURE_TRANSPORT") is None:
+    os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
+
+# â”€â”€ Top 30 Phishing Targets (bounded Levenshtein whitelist) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Restricted to avoid O(m*n) explosion on every triage request
+BRAND_DOMAINS = [
+    "microsoft.com", "google.com", "apple.com", "amazon.com",
+    "paypal.com", "netflix.com", "facebook.com", "instagram.com",
+    "linkedin.com", "twitter.com", "dropbox.com", "adobe.com",
+    "chase.com", "wellsfargo.com", "bankofamerica.com", "citibank.com",
+    "hsbc.com", "barclays.com", "americanexpress.com", "usbank.com",
+    "sbi.co.in", "hdfcbank.com", "icicibank.com", "axisbank.com",
+    "yahoo.com", "outlook.com", "icloud.com", "github.com",
+    "steam.com", "ebay.com",
+]
+
+# Length-delta pre-filter: skip Levenshtein if domain lengths differ by more than this
+LEVENSHTEIN_LENGTH_DELTA = 3
+LEVENSHTEIN_THRESHOLD = 3  # Max edit distance to flag as typosquat
+
+
+
+
+=== FILE: backend_server\gmail\oauth_routes.py ===
+"""
+SOAR Backend â€” Android Auth Route (serverAuthCode exchange)
+
+Single endpoint:
+  POST /auth/google  â† receives { "auth_code": "..." } from the Flutter/Android app
+
+Architecture change from browser-flow:
+  The old /login + /oauth2callback flow assumed the user opens a browser on
+  the *server*. That doesn't work when the client is a mobile app. Instead:
+    1. Flutter calls `GoogleSignIn.signIn()` which opens a native Google
+       sign-in sheet on the phone and returns a one-time `serverAuthCode`.
+    2. The app POSTs that code to this endpoint.
+    3. We exchange it for access_token + refresh_token using the Web Client
+       ID's client_secret (redirect_uri="" for mobile-originated codes).
+    4. We immediately register users.watch() and start receiving real-time
+       Pub/Sub pushes for that user's INBOX.
+
+Why gmail.modify?
+  With gmail.modify we can auto-label detected phishing emails (e.g.,
+  apply a "[PHISHING]" label) â€” gives the user visual feedback even
+  before they open the SOAR app.
+"""
+
+from __future__ import annotations
+
+import logging
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+from google_auth_oauthlib.flow import Flow
+from googleapiclient.discovery import build
+
+from config import (
+    GMAIL_CLIENT_SECRETS_FILE,
+    GMAIL_SCOPES,
+    GMAIL_PUBSUB_TOPIC,
+)
+from gmail.user_store import upsert_user
+
+logger = logging.getLogger("soar.gmail.auth")
+
+router = APIRouter(tags=["Gmail Auth"])
+
+
+class AndroidAuthPayload(BaseModel):
+    """Payload sent by the Flutter/Android client after Google Sign-In."""
+    auth_code: str
+
+
+@router.post("/auth/google")
+async def authenticate_android_user(payload: AndroidAuthPayload):
+    """
+    Exchange a one-time serverAuthCode from the Android/Flutter client
+    for a full OAuth2 credential set, then activate Gmail real-time watch().
+
+    The redirect_uri MUST be "" (empty string) when exchanging an auth code
+    that originated from an Android client's requestServerAuthCode() call.
+    This is a Google-specific requirement â€” using any other value (even
+    "urn:ietf:wg:oauth:2.0:oob") will fail with an "invalid_grant" error.
+    """
+    try:
+        flow = Flow.from_client_secrets_file(
+            GMAIL_CLIENT_SECRETS_FILE,
+            scopes=GMAIL_SCOPES,
+            redirect_uri="",  # Critical: empty string for mobile auth codes
+        )
+        flow.fetch_token(code=payload.auth_code)
+        creds = flow.credentials
+    except Exception as e:
+        logger.error("Token exchange failed: %s", e)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Token exchange failed: {str(e)}",
+        )
+
+    # Build the Gmail API client with the user's fresh tokens
+    service = build("gmail", "v1", credentials=creds)
+    profile = service.users().getProfile(userId="me").execute()
+    email_address = profile["emailAddress"]
+
+    # Register real-time Pub/Sub push notifications on the user's INBOX
+    watch_body = {
+        "labelIds": ["INBOX"],
+        "topicName": GMAIL_PUBSUB_TOPIC,
+        "labelFilterBehavior": "INCLUDE",
+    }
+    watch_response = service.users().watch(userId="me", body=watch_body).execute()
+
+    history_id = watch_response["historyId"]
+    expiration = int(watch_response["expiration"])
+
+    # Persist user credentials + cursor so the webhook handler can use them
+    await upsert_user(
+        email=email_address,
+        creds_json=creds.to_json(),
+        history_id=history_id,
+        watch_expiry_ms=expiration,
+    )
+
+    logger.info(
+        "Gmail watch activated for %s  (historyId=%s, expires=%s)",
+        email_address, history_id, expiration,
+    )
+
+    return {
+        "status": "watch_activated",
+        "email": email_address,
+        "starting_history_id": history_id,
+        "watch_expiration_ms": expiration,
+        "message": (
+            "Real-time Gmail monitoring is now active. "
+            "New emails will be pushed to /webhook/gmail within 1-3 seconds."
+        ),
+    }
+
+
+
+
+=== FILE: backend_server\gmail\webhook_handler.py ===
+"""
+SOAR Backend â€” Gmail Pub/Sub Webhook & Email Processor
+
+POST /webhook/gmail  â† called by Google Cloud Pub/Sub (push subscription)
+
+How it works:
+  1. Pub/Sub sends a POST with a base64 envelope containing { emailAddress, historyId }.
+  2. We immediately return 200 OK (Pub/Sub retries on anything else).
+  3. A background task uses the historyId delta to fetch only the *new*
+     messages via users.history.list â€” no polling, no full-sync.
+  4. Each new email is decoded from raw RFC 5322, URLs are extracted,
+     and the existing triage + email analysis pipeline is invoked.
+
+Gotcha handling:
+  â€¢ Duplicate messages:  checked against processed_messages table (at-least-once).
+  â€¢ Expired historyId:   404 from History API â†’ reset cursor from getProfile().
+  â€¢ Token refresh:       automatic via google-auth when creds.expired == True.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import logging
+import email as email_lib
+from email import policy
+from email.message import EmailMessage
+from typing import Optional
+
+from fastapi import APIRouter, Request, BackgroundTasks
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request as GoogleAuthRequest
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+from config import GMAIL_SCOPES
+from gmail.user_store import (
+    get_user,
+    update_creds,
+    update_history_id,
+    is_message_processed,
+    mark_message_processed,
+)
+from models import EmailScanPayload, TriagePayload
+from models.email_analyzer import analyze_email, extract_urls_from_email
+from models.feature_extractor import extract_domain
+from campaign_db import record_incident
+
+logger = logging.getLogger("soar.gmail.webhook")
+
+router = APIRouter(tags=["Gmail Webhook"])
+
+# â”€â”€ URL extraction regex (for raw MIME bodies) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+import re
+
+_URL_PATTERN = re.compile(
+    r'https?://[^\s<>"\')\]]+',
+    re.IGNORECASE,
+)
+
+_HREF_PATTERN = re.compile(
+    r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+# â”€â”€ Webhook Endpoint â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+@router.post("/webhook/gmail")
+async def gmail_pubsub_webhook(request: Request, background_tasks: BackgroundTasks):
+    """
+    Receive a push notification from Google Cloud Pub/Sub.
+
+    Envelope format:
+    {
+      "message": {
+        "data": "<base64 of {emailAddress, historyId}>",
+        "messageId": "...",
+        "publishTime": "..."
+      },
+      "subscription": "projects/.../subscriptions/..."
+    }
+    """
+    envelope = await request.json()
+    message = envelope.get("message", {})
+
+    if "data" not in message:
+        logger.warning("Webhook received with no data field")
+        return {"status": "no_data"}
+
+    # Decode the base64 inner payload
+    decoded = base64.b64decode(message["data"])
+    notification = json.loads(decoded.decode("utf-8"))
+
+    email_address = notification.get("emailAddress")
+    new_history_id = notification.get("historyId")
+
+    if not email_address or not new_history_id:
+        logger.warning("Malformed Gmail notification: %s", notification)
+        return {"status": "malformed"}
+
+    logger.info(
+        "Pub/Sub push: email=%s historyId=%s", email_address, new_history_id
+    )
+
+    # Offload the heavy work so we return 200 OK within milliseconds
+    background_tasks.add_task(
+        process_mailbox_changes, email_address, new_history_id
+    )
+
+    # Pub/Sub considers any non-2xx as a failure and retries
+    return {"status": "acknowledged"}
+
+
+# â”€â”€ Background Processor â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+async def process_mailbox_changes(email_address: str, new_history_id: str):
+    """
+    Fetch new messages since our last stored historyId, parse each one
+    through the full SOAR email analysis pipeline, and broadcast results.
+    """
+    user = await get_user(email_address)
+    if not user:
+        logger.warning("Webhook for unknown user %s â€” ignoring", email_address)
+        return
+
+    # Rebuild credentials and auto-refresh if expired
+    creds = Credentials.from_authorized_user_info(
+        json.loads(user["creds_json"]), GMAIL_SCOPES
+    )
+    if creds.expired and creds.refresh_token:
+        creds.refresh(GoogleAuthRequest())
+        await update_creds(email_address, creds.to_json())
+        logger.info("Refreshed OAuth token for %s", email_address)
+
+    service = build("gmail", "v1", credentials=creds)
+    start_history_id = user["last_history_id"]
+
+    # â”€â”€ Fetch history delta â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    try:
+        history_response = (
+            service.users()
+            .history()
+            .list(
+                userId="me",
+                startHistoryId=start_history_id,
+                historyTypes=["messageAdded"],
+                labelId="INBOX",
+            )
+            .execute()
+        )
+    except HttpError as e:
+        if e.resp.status == 404:
+            # historyId is too old â€” reset cursor from profile
+            logger.warning(
+                "historyId %s expired for %s â€” resetting cursor",
+                start_history_id, email_address,
+            )
+            profile = service.users().getProfile(userId="me").execute()
+            fresh_id = profile["historyId"]
+            await update_history_id(email_address, fresh_id)
+            return
+        logger.error("Gmail History API error for %s: %s", email_address, e)
+        return
+    except Exception as e:
+        logger.error("Unexpected error fetching history for %s: %s", email_address, e)
+        return
+
+    # Advance cursor immediately to prevent duplicate processing on retry
+    await update_history_id(email_address, new_history_id)
+
+    changes = history_response.get("history", [])
+    if not changes:
+        logger.debug("No new messages for %s (delta was metadata-only)", email_address)
+        return
+
+    # â”€â”€ Process each new message â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    for change in changes:
+        for msg_added in change.get("messagesAdded", []):
+            msg_id = msg_added["message"]["id"]
+
+            # Idempotency gate â€” Pub/Sub guarantees at-least-once
+            if await is_message_processed(msg_id):
+                logger.debug("Skipping already-processed msg %s", msg_id)
+                continue
+
+            try:
+                await _process_single_message(service, email_address, msg_id)
+                await mark_message_processed(msg_id, email_address)
+            except Exception as e:
+                logger.error(
+                    "Failed to process msg %s for %s: %s", msg_id, email_address, e
+                )
+
+
+async def _process_single_message(service, email_address: str, msg_id: str):
+    """
+    Fetch a single Gmail message in raw RFC 5322 format, parse it,
+    and run it through the SOAR email analysis pipeline.
+    """
+    # Fetch raw MIME bytes
+    raw_msg = (
+        service.users()
+        .messages()
+        .get(userId="me", id=msg_id, format="raw")
+        .execute()
+    )
+    raw_bytes = base64.urlsafe_b64decode(raw_msg["raw"])
+
+    # Parse RFC 5322 into a structured EmailMessage
+    parsed: EmailMessage = email_lib.message_from_bytes(
+        raw_bytes, policy=policy.default
+    )
+
+    # Extract fields
+    sender_full = parsed.get("From", "")
+    sender_email = _extract_email_from_header(sender_full)
+    sender_display = _extract_display_name(sender_full)
+    subject = parsed.get("Subject", "")
+    reply_to = parsed.get("Reply-To", "")
+    message_id_header = parsed.get("Message-ID", msg_id)
+
+    # Extract body (prefer plain text, fall back to HTML)
+    body_text = ""
+    body_html = ""
+    attachment_names = []
+
+    if parsed.is_multipart():
+        for part in parsed.walk():
+            content_type = part.get_content_type()
+            disposition = str(part.get("Content-Disposition", ""))
+
+            if "attachment" in disposition:
+                filename = part.get_filename()
+                if filename:
+                    attachment_names.append(filename)
+                continue
+
+            if content_type == "text/plain" and not body_text:
+                payload = part.get_content()
+                if isinstance(payload, str):
+                    body_text = payload
+            elif content_type == "text/html" and not body_html:
+                payload = part.get_content()
+                if isinstance(payload, str):
+                    body_html = payload
+    else:
+        content_type = parsed.get_content_type()
+        payload = parsed.get_content()
+        if isinstance(payload, str):
+            if content_type == "text/html":
+                body_html = payload
+            else:
+                body_text = payload
+
+    # Build headers dict for the analyzer
+    headers = {}
+    if reply_to:
+        headers["reply-to"] = reply_to
+
+    # Construct the EmailScanPayload and run through existing pipeline
+    scan_payload = EmailScanPayload(
+        sender_email=sender_email,
+        sender_display_name=sender_display,
+        subject=subject,
+        body_text=body_text,
+        body_html=body_html,
+        urls=[],  # Will be extracted by analyze_email
+        headers=headers,
+        attachment_names=attachment_names,
+        message_id=message_id_header,
+    )
+
+    result = await analyze_email(scan_payload)
+
+    # Log the result
+    emoji = {"phishing": "ðŸš¨", "suspicious": "âš ï¸", "safe": "âœ…"}.get(result.verdict, "â“")
+    logger.info(
+        "%s [%s] msg=%s from=%s subject='%s' verdict=%s confidence=%.2f threats=%d urls=%d",
+        emoji, email_address, msg_id, sender_email,
+        subject[:50], result.verdict, result.confidence,
+        len(result.threats), result.urls_extracted,
+    )
+
+    # Record incidents for malicious domains found in the email
+    if result.verdict in ("phishing", "suspicious"):
+        for url, score in result.url_scores.items():
+            if score > 0.4:
+                domain = extract_domain(url)
+                if domain:
+                    await record_incident(domain, "gmail-webhook")
+
+
+# â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+def _extract_email_from_header(from_header: str) -> str:
+    """Extract 'user@example.com' from 'Display Name <user@example.com>'."""
+    match = re.search(r'<([^>]+)>', from_header)
+    if match:
+        return match.group(1).strip()
+    # Bare email with no angle brackets
+    return from_header.strip()
+
+
+def _extract_display_name(from_header: str) -> str:
+    """Extract 'Display Name' from 'Display Name <user@example.com>'."""
+    match = re.search(r'^(.*?)\s*<', from_header)
+    if match:
+        name = match.group(1).strip().strip('"').strip("'")
+        return name
+    return ""
+
+
+
+
+=== FILE: soar_client\lib\services\api_service.dart ===
+/// HTTP API service for Tier 3 reporting and general backend calls.
+///
+/// Handles fetching CERT-In compliant reports and submitting
+/// intelligence packages to the FastAPI backend.
+library;
+
+import 'dart:convert';
+import 'package:http/http.dart' as http;
+import '../models/soar_models.dart';
+
+class ApiService {
+  /// Base URL of the FastAPI backend.
+  final String baseUrl;
+
+  ApiService({this.baseUrl = 'http://10.0.2.2:8000'});
+
+  /// Fetch list of generated intelligence reports.
+  Future<List<IntelReport>> fetchReports() async {
+    final response = await http.get(
+      Uri.parse('$baseUrl/api/v1/reports'),
+      headers: {'Accept': 'application/json'},
+    );
+
+    if (response.statusCode == 200) {
+      final List<dynamic> data = jsonDecode(response.body) as List<dynamic>;
+      return data
+          .map((e) => IntelReport.fromJson(e as Map<String, dynamic>))
+          .toList();
+    }
+    throw Exception('Failed to fetch reports: ${response.statusCode}');
+  }
+
+  /// Submit a CERT-In intelligence package for law enforcement escalation.
+  Future<bool> submitReport(String reportId) async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/api/v1/reports/$reportId/submit'),
+      headers: {'Content-Type': 'application/json'},
+    );
+    return response.statusCode == 200 || response.statusCode == 201;
+  }
+
+  /// Download a report PDF (returns raw bytes).
+  Future<List<int>> downloadReportPdf(String reportId) async {
+    final response = await http.get(
+      Uri.parse('$baseUrl/api/v1/reports/$reportId/pdf'),
+    );
+    if (response.statusCode == 200) {
+      return response.bodyBytes;
+    }
+    throw Exception('Failed to download report: ${response.statusCode}');
+  }
+}
+
+
+
+
+=== FILE: soar_client\lib\services\websocket_service.dart ===
+/// WebSocket service for Tier 1 real-time triage dashboard.
+///
+/// Maintains a persistent connection to the FastAPI backend,
+/// streaming live phishing block events and peer network updates
+/// without stalling the main UI thread.
+library;
+
+import 'dart:async';
+import 'dart:convert';
+import 'package:web_socket_channel/web_socket_channel.dart';
+import '../models/soar_models.dart';
+
+class WebSocketService {
+  WebSocketChannel? _channel;
+  final StreamController<PhishingEvent> _eventController =
+      StreamController<PhishingEvent>.broadcast();
+  final StreamController<bool> _connectionController =
+      StreamController<bool>.broadcast();
+
+  Timer? _reconnectTimer;
+  bool _disposed = false;
+
+  /// The backend WebSocket endpoint.
+  final String wsUrl;
+
+  WebSocketService({this.wsUrl = 'ws://10.0.2.2:8000/ws/triage'});
+
+  /// Exposed stream of live phishing events.
+  Stream<PhishingEvent> get events => _eventController.stream;
+
+  /// Connection status stream: true = connected.
+  Stream<bool> get connectionStatus => _connectionController.stream;
+
+  /// Initiate WebSocket connection.
+  void connect() {
+    if (_disposed) return;
+    try {
+      _channel = WebSocketChannel.connect(Uri.parse(wsUrl));
+      _connectionController.add(true);
+
+      _channel!.stream.listen(
+        (message) {
+          try {
+            final data = jsonDecode(message as String) as Map<String, dynamic>;
+            final event = PhishingEvent.fromJson(data);
+            _eventController.add(event);
+          } catch (_) {
+            // Malformed message â€” silently drop
+          }
+        },
+        onDone: () {
+          _connectionController.add(false);
+          _scheduleReconnect();
+        },
+        onError: (_) {
+          _connectionController.add(false);
+          _scheduleReconnect();
+        },
+      );
+    } catch (_) {
+      _connectionController.add(false);
+      _scheduleReconnect();
+    }
+  }
+
+  void _scheduleReconnect() {
+    if (_disposed) return;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = Timer(const Duration(seconds: 5), connect);
+  }
+
+  /// Close the WebSocket connection and release resources.
+  void dispose() {
+    _disposed = true;
+    _reconnectTimer?.cancel();
+    _channel?.sink.close();
+    _eventController.close();
+    _connectionController.close();
+  }
+}
+
+
+
+
+=== FILE: soar_client\lib\services\gmail_auth_service.dart ===
+/// SOAR Client â€” Gmail Authentication Service
+///
+/// Uses [google_sign_in] to trigger Android's native Google Sign-In sheet,
+/// request the `gmail.modify` scope, and retrieve a one-time `serverAuthCode`.
+/// That code is then POSTed to the backend's `POST /auth/google` endpoint,
+/// which exchanges it for long-lived tokens and activates real-time
+/// Gmail â†’ Pub/Sub â†’ webhook monitoring.
+///
+/// Architecture note:
+///   The WEB Client ID (not the Android Client ID) must be passed as
+///   [serverClientId]. Google's OAuth system uses the Web Client ID to
+///   issue a server-exchangeable auth code. The Android Client ID is only
+///   used implicitly by Play Services to verify the calling app's SHA-1.
+
+library;
+
+import 'dart:convert';
+import 'package:google_sign_in/google_sign_in.dart';
+import 'package:http/http.dart' as http;
+
+/// Configuration â€” update these before building
+class GmailAuthConfig {
+  /// The **Web Application** OAuth Client ID from Google Cloud Console.
+  /// NOT the Android Client ID â€” Google requires the Web ID for serverAuthCode.
+  static const String webClientId =
+      '1089603468965-cna69vf6su8nmvp7112siooa36j6e7g9.apps.googleusercontent.com';
+
+  /// Backend base URL â€” your active localtunnel/ngrok URL
+  /// âš ï¸ Update this if your tunnel restarts
+  static const String backendBaseUrl = 'https://soar-phishing-backend.loca.lt';
+}
+
+/// Result of a Gmail authentication attempt.
+class GmailAuthResult {
+  final bool success;
+  final String? email;
+  final String? historyId;
+  final String? error;
+
+  const GmailAuthResult({
+    required this.success,
+    this.email,
+    this.historyId,
+    this.error,
+  });
+
+  @override
+  String toString() => success
+      ? 'GmailAuthResult(email=$email, historyId=$historyId)'
+      : 'GmailAuthResult(error=$error)';
+}
+
+/// Service that handles the full Gmail OAuth flow from the mobile side.
+class GmailAuthService {
+  late final GoogleSignIn _googleSignIn;
+
+  /// Whether a user has successfully authenticated and their watch() is active.
+  bool _isConnected = false;
+  bool get isConnected => _isConnected;
+
+  /// The authenticated user's email address (set after successful auth).
+  String? _connectedEmail;
+  String? get connectedEmail => _connectedEmail;
+
+  GmailAuthService() {
+    _googleSignIn = GoogleSignIn(
+      serverClientId: GmailAuthConfig.webClientId,
+      scopes: ['https://www.googleapis.com/auth/gmail.modify'],
+      forceCodeForRefreshToken: true,
+    );
+  }
+
+  /// Trigger the Google Sign-In flow and connect Gmail monitoring.
+  ///
+  /// Flow:
+  ///   1. Opens native Google sign-in sheet on Android
+  ///   2. User consents to gmail.modify scope
+  ///   3. Google returns a one-time serverAuthCode
+  ///   4. We POST that code to backend /auth/google
+  ///   5. Backend exchanges it for tokens + activates watch()
+  Future<GmailAuthResult> connectGmail() async {
+    try {
+      // Step 1: Native Google Sign-In
+      final account = await _googleSignIn.signIn();
+
+      if (account == null) {
+        return const GmailAuthResult(
+          success: false,
+          error: 'Sign-in cancelled by user',
+        );
+      }
+
+      final serverAuthCode = account.serverAuthCode;
+      if (serverAuthCode == null) {
+        return const GmailAuthResult(
+          success: false,
+          error: 'No serverAuthCode received â€” check serverClientId configuration',
+        );
+      }
+
+      // Step 2: Send auth code to backend
+      final response = await http.post(
+        Uri.parse('${GmailAuthConfig.backendBaseUrl}/auth/google'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'auth_code': serverAuthCode}),
+      );
+
+      if (response.statusCode != 200) {
+        final errorBody = jsonDecode(response.body);
+        return GmailAuthResult(
+          success: false,
+          error: errorBody['detail'] ?? 'Backend returned ${response.statusCode}',
+        );
+      }
+
+      final data = jsonDecode(response.body);
+      _isConnected = true;
+      _connectedEmail = data['email'] as String?;
+
+      return GmailAuthResult(
+        success: true,
+        email: _connectedEmail,
+        historyId: data['starting_history_id'] as String?,
+      );
+    } catch (e) {
+      return GmailAuthResult(
+        success: false,
+        error: e.toString(),
+      );
+    }
+  }
+
+  /// Disconnect Gmail monitoring.
+  Future<void> disconnectGmail() async {
+    await _googleSignIn.signOut();
+    _isConnected = false;
+    _connectedEmail = null;
+  }
+
+  /// Check if user is currently signed in (does not hit network).
+  Future<bool> isSignedIn() async {
+    return _googleSignIn.isSignedIn();
+  }
+}
+
+
+
+

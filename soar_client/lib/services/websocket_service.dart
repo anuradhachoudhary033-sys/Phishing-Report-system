@@ -23,7 +23,9 @@ class WebSocketService {
   /// The backend WebSocket endpoint.
   final String wsUrl;
 
-  WebSocketService({this.wsUrl = 'ws://10.0.2.2:8000/ws/triage'});
+  WebSocketService({
+    this.wsUrl = 'wss://mangle-fading-deploy.ngrok-free.dev/ws/triage',
+  });
 
   /// Exposed stream of live phishing events.
   Stream<PhishingEvent> get events => _eventController.stream;

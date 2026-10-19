@@ -18,16 +18,14 @@ import 'dart:convert';
 import 'package:google_sign_in/google_sign_in.dart';
 import 'package:http/http.dart' as http;
 
-/// Configuration — update these before building
 class GmailAuthConfig {
   /// The **Web Application** OAuth Client ID from Google Cloud Console.
   /// NOT the Android Client ID — Google requires the Web ID for serverAuthCode.
   static const String webClientId =
       '1089603468965-cna69vf6su8nmvp7112siooa36j6e7g9.apps.googleusercontent.com';
 
-  /// Backend base URL — your active localtunnel/ngrok URL
-  /// ⚠️ Update this if your tunnel restarts
-  static const String backendBaseUrl = 'https://soar-phishing-backend.loca.lt';
+  /// Backend base URL — your permanent static ngrok domain
+  static const String backendBaseUrl = 'https://mangle-fading-deploy.ngrok-free.dev';
 }
 
 /// Result of a Gmail authentication attempt.

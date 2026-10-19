@@ -60,6 +60,10 @@ GMAIL_PUBSUB_TOPIC = os.getenv(
 if os.getenv("OAUTHLIB_INSECURE_TRANSPORT") is None:
     os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 
+# Allow Google Sign-In on Android to include openid/email/profile alongside gmail.modify
+if os.getenv("OAUTHLIB_RELAX_TOKEN_SCOPE") is None:
+    os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
+
 # ── Top 30 Phishing Targets (bounded Levenshtein whitelist) ──────────────
 # Restricted to avoid O(m*n) explosion on every triage request
 BRAND_DOMAINS = [

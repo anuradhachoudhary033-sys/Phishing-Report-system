@@ -1,24 +1,6 @@
-"""
-SOAR Backend — Gmail Pub/Sub Webhook & Email Processor
-
-POST /webhook/gmail  ← called by Google Cloud Pub/Sub (push subscription)
-
-How it works:
-  1. Pub/Sub sends a POST with a base64 envelope containing { emailAddress, historyId }.
-  2. We immediately return 200 OK (Pub/Sub retries on anything else).
-  3. A background task uses the historyId delta to fetch only the *new*
-     messages via users.history.list — no polling, no full-sync.
-  4. Each new email is decoded from raw RFC 5322, URLs are extracted,
-     and the existing triage + email analysis pipeline is invoked.
-
-Gotcha handling:
-  • Duplicate messages:  checked against processed_messages table (at-least-once).
-  • Expired historyId:   404 from History API → reset cursor from getProfile().
-  • Token refresh:       automatic via google-auth when creds.expired == True.
-"""
-
 from __future__ import annotations
 
+from uuid import uuid4
 import base64
 import json
 import logging
@@ -41,10 +23,30 @@ from gmail.user_store import (
     is_message_processed,
     mark_message_processed,
 )
-from models import EmailScanPayload, TriagePayload
+from models import EmailScanPayload, PhishingEvent, TriagePayload
 from models.email_analyzer import analyze_email, extract_urls_from_email
 from models.feature_extractor import extract_domain
 from campaign_db import record_incident
+
+"""
+SOAR Backend — Gmail Pub/Sub Webhook & Email Processor
+
+POST /webhook/gmail  ← called by Google Cloud Pub/Sub (push subscription)
+
+How it works:
+  1. Pub/Sub sends a POST with a base64 envelope containing { emailAddress, historyId }.
+  2. We immediately return 200 OK (Pub/Sub retries on anything else).
+  3. A background task uses the historyId delta to fetch only the *new*
+     messages via users.history.list — no polling, no full-sync.
+  4. Each new email is decoded from raw RFC 5322, URLs are extracted,
+     and the existing triage + email analysis pipeline is invoked.
+
+Gotcha handling:
+  • Duplicate messages:  checked against processed_messages table (at-least-once).
+  • Expired historyId:   404 from History API → reset cursor from getProfile().
+  • Token refresh:       automatic via google-auth when creds.expired == True.
+"""
+
 
 logger = logging.getLogger("soar.gmail.webhook")
 
@@ -289,6 +291,18 @@ async def _process_single_message(service, email_address: str, msg_id: str):
                 domain = extract_domain(url)
                 if domain:
                     await record_incident(domain, "gmail-webhook")
+
+        # Broadcast live alert to connected Flutter WebSocket clients
+        from main import manager
+        event = PhishingEvent(
+            id=f"gmail-{uuid4().hex[:12]}",
+            url=f"email://{sender_email}",
+            risk_score=result.confidence,
+            is_phishing=result.verdict == "phishing",
+            source_ip="gmail-webhook",
+            peer_node=email_address,
+        )
+        await manager.broadcast(event)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
