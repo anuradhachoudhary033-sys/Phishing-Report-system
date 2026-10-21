@@ -45,15 +45,15 @@ except ImportError:
 # Each weight represents how much a normalised feature contributes
 # to the final risk score.  Weights sum to ~1.0.
 _WEIGHTS = {
-    "entropy":            0.10,   # High entropy → suspicious random strings
-    "url_length":         0.08,   # Very long URLs → obfuscation
+    "entropy":            0.08,   # High entropy → suspicious random strings
+    "url_length":         0.05,   # Very long URLs → obfuscation
     "subdomain_depth":    0.10,   # Deep subdomains → trust dilution
-    "path_depth":         0.05,   # Deep paths → redirect chains
+    "path_depth":         0.04,   # Deep paths → redirect chains
     "special_char_ratio": 0.08,   # Excessive encoding → evasion
     "has_ip_address":     0.12,   # IP in hostname → classic phishing
-    "keyword_score":      0.20,   # Suspicious keywords → direct signal
-    "tld_risk":           0.10,   # Risky TLD → disposable domains
-    "typosquat":          0.17,   # Brand impersonation → high intent
+    "keyword_score":      0.25,   # Suspicious keywords → strongest signal
+    "tld_risk":           0.08,   # Risky TLD → disposable domains
+    "typosquat":          0.20,   # Brand impersonation → high intent
 }
 
 

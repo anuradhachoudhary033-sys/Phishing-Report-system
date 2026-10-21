@@ -257,10 +257,10 @@ async def analyze_email(payload: EmailScanPayload) -> EmailScanResult:
     high_count = sum(1 for t in threats if t.severity == "high")
     medium_count = sum(1 for t in threats if t.severity == "medium")
 
-    if high_count >= 2 or (high_count >= 1 and max_url_score > 0.6):
+    if high_count >= 2 or (high_count >= 1 and max_url_score > 0.4):
         verdict = "phishing"
         confidence = min(0.95, 0.5 + high_count * 0.15 + max_url_score * 0.3)
-    elif high_count >= 1 or medium_count >= 2 or max_url_score > 0.4:
+    elif high_count >= 1 or medium_count >= 1 or max_url_score > 0.35:
         verdict = "suspicious"
         confidence = min(0.8, 0.3 + high_count * 0.1 + medium_count * 0.1 + max_url_score * 0.2)
     else:

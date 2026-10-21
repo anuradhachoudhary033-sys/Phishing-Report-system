@@ -96,6 +96,11 @@ def _check_typosquat(domain: str) -> tuple[float, str | None]:
 
         # Length-delta pre-filter: skip if lengths differ too much
         if abs(len(domain_base) - len(brand_base)) > LEVENSHTEIN_LENGTH_DELTA:
+            # But still check for hyphenated brand pattern (e.g. paypal-secure.com)
+            # even when length delta is large
+            if brand_base in domain_base.split("-"):
+                # Brand name appears as an exact hyphenated segment
+                return 0.75, brand
             continue
 
         dist = levenshtein_distance(domain_base, brand_base)
@@ -110,6 +115,15 @@ def _check_typosquat(domain: str) -> tuple[float, str | None]:
             if score > best_score:
                 best_score = score
                 best_brand = brand
+
+    # Secondary check: brand name as hyphenated prefix (e.g. 'paypal-secure-login.com')
+    # This catches domains that passed the length-delta filter but still embed a brand
+    if best_score == 0.0:
+        for brand in BRAND_DOMAINS:
+            brand_base = brand.rsplit(".", 1)[0] if "." in brand else brand
+            segments = domain_base.split("-")
+            if brand_base in segments or domain_base.startswith(brand_base + "-"):
+                return 0.75, brand
 
     return best_score, best_brand
 

@@ -28,8 +28,8 @@ HOST = os.getenv("SOAR_HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", os.getenv("SOAR_PORT", "8000")))
 
 # ── Triage Thresholds ────────────────────────────────────────────────────
-BLOCK_THRESHOLD = 0.95      # Score > this → instant block at edge
-SANDBOX_THRESHOLD = 0.50    # Score > this but < BLOCK → forward to sandbox
+BLOCK_THRESHOLD = 0.70      # Score > this → instant block at edge
+SANDBOX_THRESHOLD = 0.35    # Score > this but < BLOCK → forward to sandbox
 ONNX_MODEL_PATH = WEIGHTS_DIR / "phishing_minilm.onnx"
 
 # ── Sandbox ──────────────────────────────────────────────────────────────
