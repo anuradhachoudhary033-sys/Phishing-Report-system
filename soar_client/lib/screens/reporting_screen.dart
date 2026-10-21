@@ -9,6 +9,7 @@ import 'dart:math';
 import 'package:flutter/material.dart';
 import '../theme/soar_theme.dart';
 import '../models/soar_models.dart';
+import '../services/api_service.dart';
 import '../widgets/shared_widgets.dart';
 
 class ReportingScreen extends StatefulWidget {
@@ -19,14 +20,38 @@ class ReportingScreen extends StatefulWidget {
 }
 
 class _ReportingScreenState extends State<ReportingScreen> {
+  final ApiService _api = ApiService();
   final List<IntelReport> _reports = [];
-  final bool _loading = false;
+  bool _loading = true;
   String? _submittingId;
 
   @override
   void initState() {
     super.initState();
-    _loadDemoReports();
+    _loadReports();
+  }
+
+  Future<void> _loadReports() async {
+    try {
+      final liveReports = await _api.fetchReports();
+      if (!mounted) return;
+      setState(() {
+        if (liveReports.isNotEmpty) {
+          _reports
+            ..clear()
+            ..addAll(liveReports);
+        } else {
+          _loadDemoReports(); // Fallback if DB has 0 reports yet
+        }
+        _loading = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _loadDemoReports(); // Fallback if endpoint isn't implemented/reachable
+        _loading = false;
+      });
+    }
   }
 
   void _loadDemoReports() {
@@ -61,8 +86,12 @@ class _ReportingScreenState extends State<ReportingScreen> {
   Future<void> _submitReport(IntelReport report) async {
     setState(() => _submittingId = report.reportId);
 
-    // Simulate network call
-    await Future.delayed(const Duration(seconds: 2));
+    try {
+      await _api.submitReport(report.reportId);
+    } catch (_) {
+      // Fallback delay if submitting a demo report ID
+      await Future.delayed(const Duration(seconds: 1));
+    }
 
     if (!mounted) return;
     setState(() {

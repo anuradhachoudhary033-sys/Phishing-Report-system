@@ -41,17 +41,24 @@ class _DashboardScreenState extends State<DashboardScreen> {
     _ws.connect();
 
     _statusSub = _ws.connectionStatus.listen((status) {
-      setState(() => _connected = status);
-      if (status && _demoMode) {
-        _demoMode = false;
-        _demoTimer?.cancel();
-      }
+      if (!mounted) return;
+      setState(() {
+        _connected = status;
+        if (status && _demoMode) {
+          _demoMode = false;
+          _demoTimer?.cancel();
+          // Clear fake demo events so only real backend events are shown
+          _events.clear();
+          _totalBlocked = 0;
+          _phishingDetected = 0;
+        }
+      });
     });
 
     _eventSub = _ws.events.listen(_handleEvent);
 
-    // Start demo mode after a short delay if no connection
-    Future.delayed(const Duration(seconds: 2), () {
+    // Wait 4 seconds before falling back to demo mode
+    Future.delayed(const Duration(seconds: 4), () {
       if (!_connected && mounted) {
         _startDemoMode();
       }

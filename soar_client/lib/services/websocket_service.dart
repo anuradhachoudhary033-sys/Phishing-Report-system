@@ -1,4 +1,4 @@
-/// WebSocket service for Tier 1 real-time triage dashboard.
+﻿/// WebSocket service for Tier 1 real-time triage dashboard.
 ///
 /// Maintains a persistent connection to the FastAPI backend,
 /// streaming live phishing block events and peer network updates
@@ -18,7 +18,9 @@ class WebSocketService {
       StreamController<bool>.broadcast();
 
   Timer? _reconnectTimer;
+  Timer? _pingTimer;
   bool _disposed = false;
+  bool _connected = false;
 
   /// The backend WebSocket endpoint.
   final String wsUrl;
@@ -38,7 +40,20 @@ class WebSocketService {
     if (_disposed) return;
     try {
       _channel = WebSocketChannel.connect(Uri.parse(wsUrl));
-      _connectionController.add(true);
+
+      // Only mark connected once the handshake completes successfully.
+      // WebSocketChannel.connect() is lazy — the connection is not verified
+      // until .ready resolves, so we must not emit true before this.
+      _channel!.ready.then((_) {
+        if (!_disposed) {
+          _connected = true;
+          _connectionController.add(true);
+          _startPing();
+        }
+      }).catchError((_) {
+        _connectionController.add(false);
+        _scheduleReconnect();
+      });
 
       _channel!.stream.listen(
         (message) {
@@ -51,10 +66,14 @@ class WebSocketService {
           }
         },
         onDone: () {
+          _connected = false;
+          _pingTimer?.cancel();
           _connectionController.add(false);
           _scheduleReconnect();
         },
         onError: (_) {
+          _connected = false;
+          _pingTimer?.cancel();
           _connectionController.add(false);
           _scheduleReconnect();
         },
@@ -63,6 +82,24 @@ class WebSocketService {
       _connectionController.add(false);
       _scheduleReconnect();
     }
+  }
+
+  /// Send a periodic ping to keep the ngrok tunnel alive.
+  /// Ngrok drops idle WebSocket connections after ~60 seconds of inactivity.
+  void _startPing() {
+    _pingTimer?.cancel();
+    _pingTimer = Timer.periodic(const Duration(seconds: 30), (_) {
+      if (_disposed || !_connected) return;
+      try {
+        _channel?.sink.add('{"ping":true}');
+      } catch (_) {
+        // Sink is dead — trigger reconnect
+        _connected = false;
+        _pingTimer?.cancel();
+        _connectionController.add(false);
+        _scheduleReconnect();
+      }
+    });
   }
 
   void _scheduleReconnect() {
@@ -75,6 +112,7 @@ class WebSocketService {
   void dispose() {
     _disposed = true;
     _reconnectTimer?.cancel();
+    _pingTimer?.cancel();
     _channel?.sink.close();
     _eventController.close();
     _connectionController.close();

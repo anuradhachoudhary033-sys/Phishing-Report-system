@@ -73,18 +73,24 @@ async def authenticate_android_user(payload: AndroidAuthPayload):
             detail=f"Token exchange failed: {str(e)}",
         )
 
-    # Build the Gmail API client with the user's fresh tokens
-    service = build("gmail", "v1", credentials=creds)
-    profile = service.users().getProfile(userId="me").execute()
-    email_address = profile["emailAddress"]
+    # Build the Gmail API client and register Pub/Sub push notifications
+    try:
+        service = build("gmail", "v1", credentials=creds)
+        profile = service.users().getProfile(userId="me").execute()
+        email_address = profile["emailAddress"]
 
-    # Register real-time Pub/Sub push notifications on the user's INBOX
-    watch_body = {
-        "labelIds": ["INBOX"],
-        "topicName": GMAIL_PUBSUB_TOPIC,
-        "labelFilterBehavior": "INCLUDE",
-    }
-    watch_response = service.users().watch(userId="me", body=watch_body).execute()
+        watch_body = {
+            "labelIds": ["INBOX"],
+            "topicName": GMAIL_PUBSUB_TOPIC,
+            "labelFilterBehavior": "INCLUDE",
+        }
+        watch_response = service.users().watch(userId="me", body=watch_body).execute()
+    except Exception as e:
+        logger.error("Gmail watch() setup failed: %s", e)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Gmail watch setup failed: {str(e)}",
+        )
 
     history_id = watch_response["historyId"]
     expiration = int(watch_response["expiration"])

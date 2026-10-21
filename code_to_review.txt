@@ -1,602 +1,4 @@
-﻿=== FILE: backend_server\main.py ===
-"""
-SOAR Phishing Orchestrator Engine â€” FastAPI Application
-
-Full API server with:
-- Layer 1: ML-powered triage scoring (/api/v1/triage)
-- Layer 2: Async sandbox detonation (/api/v1/detonate)
-- Layer 3: CERT-In report generation and PDF download (/api/v1/reports)
-- WebSocket: Live event streaming to Flutter clients (/ws/triage)
-- Campaign tracking: SQLite-persisted incident aggregation
-"""
-
-from __future__ import annotations
-
-import asyncio
-import json
-import logging
-from contextlib import asynccontextmanager
-from datetime import datetime, timezone
-from pathlib import Path
-from uuid import uuid4
-
-from fastapi import BackgroundTasks, FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
-
-from config import CAMPAIGN_REPORT_THRESHOLD
-from models import (
-    DetonationRequest,
-    EmailScanPayload,
-    IntelReport,
-    PhishingEvent,
-    TriagePayload,
-)
-from models.email_analyzer import analyze_email, extract_urls_from_email
-from models.feature_extractor import extract_domain
-from models.triage_scorer import score_url
-from sandbox.docker_runner import run_sandbox
-from reporting import create_intel_report, generate_certin_json, save_report
-from reporting.mitre_mapper import map_techniques
-from reporting.pdf_builder import build_pdf
-from campaign_db import (
-    get_all_campaigns,
-    get_campaign_stats,
-    log_detonation,
-    mark_report_generated,
-    record_incident,
-)
-from gmail.oauth_routes import router as gmail_oauth_router
-from gmail.webhook_handler import router as gmail_webhook_router
-from gmail.user_store import init_gmail_db, prune_old_messages
-from gmail.watch_renewal import renew_all_watches
-
-# â”€â”€ Logging â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s â”‚ %(name)-18s â”‚ %(levelname)-7s â”‚ %(message)s",
-)
-logger = logging.getLogger("soar.api")
-
-
-# â”€â”€ WebSocket Connection Manager â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-class ConnectionManager:
-    """Manages active WebSocket connections for live event broadcasting."""
-
-    def __init__(self):
-        self._connections: list[WebSocket] = []
-
-    async def connect(self, ws: WebSocket):
-        await ws.accept()
-        self._connections.append(ws)
-        logger.info("Client connected (%d total)", len(self._connections))
-
-    def disconnect(self, ws: WebSocket):
-        self._connections.remove(ws)
-        logger.info("Client disconnected (%d remaining)", len(self._connections))
-
-    async def broadcast(self, event: PhishingEvent):
-        """Broadcast a phishing event to all connected clients."""
-        data = event.model_dump_json()
-        dead: list[WebSocket] = []
-        for ws in self._connections:
-            try:
-                await ws.send_text(data)
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            self._connections.remove(ws)
-
-    @property
-    def active_count(self) -> int:
-        return len(self._connections)
-
-
-manager = ConnectionManager()
-
-
-# â”€â”€ App Lifecycle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Startup / shutdown lifecycle for the SOAR API."""
-    logger.info("SOAR Phishing Orchestrator Engine starting up")
-    # Ensure campaign DB is initialized
-    from campaign_db import _ensure_db
-    await _ensure_db()
-    # Initialize Gmail user store
-    await init_gmail_db()
-    # Launch the daily watch-renewal background loop
-    renewal_task = asyncio.create_task(_daily_watch_renewal_loop())
-    yield
-    renewal_task.cancel()
-    logger.info("SOAR engine shutting down")
-
-
-app = FastAPI(
-    title="SOAR Phishing Orchestrator Engine",
-    version="1.0.0",
-    description="Enterprise-grade phishing detection SOAR pipeline",
-    lifespan=lifespan,
-)
-
-# â”€â”€ Register Gmail routers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-app.include_router(gmail_oauth_router)
-app.include_router(gmail_webhook_router)
-
-# â”€â”€ CORS (allow prototype UI + ngrok tunnel to reach API) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:5000",
-        "http://127.0.0.1:5000",
-    ],
-    allow_origin_regex=r"https://.*\.(ngrok-free\.app|ngrok-free\.dev|loca\.lt|run\.app|onrender\.com|hf\.space)",
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-# â”€â”€ Layer 1: Triage API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-@app.post("/api/v1/triage")
-async def process_triage(payload: TriagePayload, background_tasks: BackgroundTasks):
-    """
-    Score a URL using the ML triage pipeline.
-
-    Returns the risk score, action (BLOCK_INSTANT / QUEUE_SANDBOX / ALLOW),
-    and extracted features. If the action is QUEUE_SANDBOX, the detonation
-    is automatically queued as a background task.
-    """
-    result = await score_url(payload)
-
-    # Record incident in campaign tracker
-    domain = extract_domain(payload.url)
-    if domain:
-        background_tasks.add_task(
-            record_incident, domain, payload.source_ip
-        )
-
-    # Broadcast to connected WebSocket clients
-    event = PhishingEvent(
-        id=f"evt-{uuid4().hex[:12]}",
-        url=payload.url,
-        risk_score=result.risk_score,
-        is_phishing=result.is_phishing,
-        bloom_match_count=result.bloom_match_count,
-        source_ip=payload.source_ip,
-        peer_node=payload.peer_node,
-    )
-    background_tasks.add_task(manager.broadcast, event)
-
-    # Auto-queue sandbox if in the suspicious range
-    if result.action == "QUEUE_SANDBOX":
-        det_request = DetonationRequest(
-            url=payload.url,
-            triage_score=result.risk_score,
-            source_ip=payload.source_ip,
-            peer_node=payload.peer_node,
-        )
-        background_tasks.add_task(_run_detonation_pipeline, det_request)
-
-    return result.model_dump()
-
-
-# â”€â”€ Layer 2: Sandbox API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-@app.post("/api/v1/detonate")
-async def trigger_detonation(request: DetonationRequest, background_tasks: BackgroundTasks):
-    """
-    Manually trigger sandbox detonation for a URL.
-
-    The detonation runs as a background task to avoid blocking.
-    """
-    background_tasks.add_task(_run_detonation_pipeline, request)
-    return {"status": "detonation_queued", "target": request.url}
-
-
-async def _run_detonation_pipeline(request: DetonationRequest):
-    """
-    Full detonation pipeline:
-    1. Run sandbox (async Playwright)
-    2. Log result to campaign DB
-    3. Check campaign threshold for auto-report generation
-    4. Broadcast IOC update to clients
-    """
-    try:
-        result = await run_sandbox(request)
-        domain = extract_domain(request.url)
-
-        # Log detonation
-        await log_detonation(
-            url=request.url,
-            domain=domain,
-            verdict=result.verdict,
-            confidence=result.confidence_score,
-            brand_match=result.brand_match,
-            screenshot_path=result.screenshot_path,
-        )
-
-        # Record incident and check threshold
-        if domain:
-            count, threshold_crossed = await record_incident(domain)
-
-            if threshold_crossed:
-                logger.info(
-                    "Campaign threshold crossed for '%s' (%d incidents) â€” generating CERT-In report",
-                    domain, count,
-                )
-                # Auto-generate report
-                techniques = map_techniques(
-                    detonation=result,
-                    has_typosquat=False,  # Could be enriched from triage features
-                )
-                report = create_intel_report(
-                    campaign_domain=domain,
-                    campaign_ip=result.external_ips[0] if result.external_ips else "",
-                    incident_count=count,
-                    detonation_results=[result],
-                    mitre_techniques=techniques,
-                )
-                # Build PDF
-                report_data = generate_certin_json(
-                    campaign_domain=domain,
-                    campaign_ip=result.external_ips[0] if result.external_ips else "",
-                    incident_count=count,
-                    detonation_results=[result],
-                    mitre_techniques=techniques,
-                )
-                build_pdf(report_data)
-                await mark_report_generated(domain)
-                logger.info("Auto-generated report %s for campaign '%s'", report.report_id, domain)
-
-        # Broadcast as phishing event
-        if result.verdict in ("malicious", "suspicious"):
-            event = PhishingEvent(
-                id=f"det-{uuid4().hex[:12]}",
-                url=request.url,
-                risk_score=result.confidence_score,
-                is_phishing=True,
-                source_ip=request.source_ip,
-                peer_node=request.peer_node,
-            )
-            await manager.broadcast(event)
-
-    except Exception as e:
-        logger.error("Detonation pipeline failed for %s: %s", request.url, e)
-
-
-# â”€â”€ Layer 3: Reporting API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-@app.get("/api/v1/reports")
-async def list_reports():
-    """List all generated intelligence reports."""
-    reports_dir = Path("reporting/generated")
-    if not reports_dir.exists():
-        return []
-
-    reports = []
-    for json_file in sorted(reports_dir.glob("*.json"), reverse=True):
-        try:
-            data = json.loads(json_file.read_text())
-            reports.append({
-                "report_id": data["metadata"]["report_id"],
-                "cert_in_ref_no": data["metadata"]["cert_in_ref_no"],
-                "status": "generated",
-                "generated_at": data["metadata"]["generated_at"],
-                "download_url": f"/api/v1/reports/{data['metadata']['report_id']}/pdf",
-            })
-        except Exception:
-            continue
-
-    return reports
-
-
-@app.get("/api/v1/reports/{report_id}/pdf")
-async def download_report_pdf(report_id: str):
-    """Download a report as PDF."""
-    pdf_path = Path(f"reporting/generated/{report_id}.pdf")
-    if not pdf_path.exists():
-        # Try to build from JSON
-        json_path = Path(f"reporting/generated/{report_id}.json")
-        if json_path.exists():
-            report_data = json.loads(json_path.read_text())
-            pdf_path = build_pdf(report_data)
-        else:
-            return JSONResponse(
-                {"error": "Report not found"},
-                status_code=404,
-            )
-
-    return FileResponse(
-        str(pdf_path),
-        media_type="application/pdf",
-        filename=f"{report_id}.pdf",
-    )
-
-
-@app.post("/api/v1/reports/{report_id}/submit")
-async def submit_report(report_id: str):
-    """
-    Submit an intelligence package to CERT-In.
-    (Mocked for initial implementation â€” would integrate with
-    official CERT-In API or secure email relay in production.)
-    """
-    json_path = Path(f"reporting/generated/{report_id}.json")
-    if not json_path.exists():
-        return JSONResponse(
-            {"error": "Report not found"},
-            status_code=404,
-        )
-
-    # In production, this would POST to CERT-In's API
-    logger.info("Intelligence package %s submitted to CERT-In (mocked)", report_id)
-
-    return {
-        "status": "submitted",
-        "report_id": report_id,
-        "message": "Intelligence package submitted to CERT-In portal",
-    }
-
-
-@app.post("/api/v1/reports/generate")
-async def manually_generate_report(domain: str, ip: str = ""):
-    """
-    Manually trigger a CERT-In report for a specific domain.
-    """
-    stats = await get_campaign_stats(domain)
-    incident_count = stats["incident_count"] if stats else 1
-
-    techniques = map_techniques(has_typosquat=False)
-    report_data = generate_certin_json(
-        campaign_domain=domain,
-        campaign_ip=ip,
-        incident_count=incident_count,
-        detonation_results=[],
-        mitre_techniques=techniques,
-    )
-    save_report(report_data)
-    pdf_path = build_pdf(report_data)
-
-    return {
-        "status": "generated",
-        "report_id": report_data["metadata"]["report_id"],
-        "cert_in_ref_no": report_data["metadata"]["cert_in_ref_no"],
-        "pdf_path": str(pdf_path),
-    }
-
-
-# â”€â”€ Email Scanning API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-@app.post("/api/v1/scan/email")
-async def scan_email(payload: EmailScanPayload, background_tasks: BackgroundTasks):
-    """
-    Scan an email for phishing indicators.
-
-    Analyzes sender spoofing, urgency keywords, hidden link mismatches,
-    dangerous attachments, and triages all embedded URLs through the
-    ML scoring pipeline.
-    """
-    result = await analyze_email(payload)
-
-    # If phishing detected, broadcast alert and record incidents
-    if result.verdict in ("phishing", "suspicious"):
-        # Record incidents for each malicious URL's domain
-        for url, score in result.url_scores.items():
-            if score > 0.4:
-                domain = extract_domain(url)
-                if domain:
-                    background_tasks.add_task(record_incident, domain, "email-scanner")
-
-        # Broadcast as a phishing event
-        event = PhishingEvent(
-            id=f"email-{uuid4().hex[:12]}",
-            url=f"email://{payload.sender_email}",
-            risk_score=result.confidence,
-            is_phishing=result.verdict == "phishing",
-            source_ip="email-scanner",
-            peer_node="gmail-oauth",
-        )
-        background_tasks.add_task(manager.broadcast, event)
-
-    return result.model_dump()
-
-
-# â”€â”€ Campaign Tracking API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-@app.get("/api/v1/campaigns")
-async def list_campaigns():
-    """List all tracked phishing campaigns with incident counts."""
-    return await get_all_campaigns()
-
-
-@app.get("/api/v1/campaigns/{domain}")
-async def get_campaign(domain: str):
-    """Get details for a specific campaign domain."""
-    stats = await get_campaign_stats(domain)
-    if stats:
-        return stats
-    return JSONResponse({"error": "Campaign not found"}, status_code=404)
-
-
-# â”€â”€ WebSocket: Live Triage Feed â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-@app.websocket("/ws/triage")
-async def triage_websocket(ws: WebSocket):
-    """
-    WebSocket endpoint for streaming live phishing events
-    to connected Flutter mobile clients.
-
-    Clients can also send triage payloads via the WebSocket
-    for inline scoring.
-    """
-    await manager.connect(ws)
-    try:
-        while True:
-            # Accept incoming messages (triage requests from clients)
-            data = await ws.receive_text()
-            try:
-                payload = TriagePayload.model_validate_json(data)
-                result = await score_url(payload)
-
-                # Record incident
-                domain = extract_domain(payload.url)
-                if domain:
-                    await record_incident(domain, payload.source_ip)
-
-                # Build event and broadcast
-                event = PhishingEvent(
-                    id=f"ws-{uuid4().hex[:12]}",
-                    url=payload.url,
-                    risk_score=result.risk_score,
-                    is_phishing=result.is_phishing,
-                    bloom_match_count=result.bloom_match_count,
-                    source_ip=payload.source_ip,
-                    peer_node=payload.peer_node,
-                )
-                await manager.broadcast(event)
-
-            except Exception as e:
-                await ws.send_json({"error": str(e)})
-
-    except WebSocketDisconnect:
-        manager.disconnect(ws)
-
-
-# â”€â”€ Gmail Admin â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-@app.post("/admin/gmail/renew-watches")
-async def admin_renew_watches():
-    """Manually trigger watch renewal for all registered Gmail users."""
-    result = await renew_all_watches()
-    return result
-
-
-@app.post("/admin/gmail/prune-messages")
-async def admin_prune_messages(keep_days: int = 7):
-    """Purge old processed-message records to keep the DB lean."""
-    count = await prune_old_messages(keep_days)
-    return {"pruned": count, "keep_days": keep_days}
-
-
-async def _daily_watch_renewal_loop():
-    """
-    Background coroutine that renews all Gmail watches once every 24 hours
-    and prunes stale message IDs. Runs for the lifetime of the server.
-    """
-    while True:
-        try:
-            await asyncio.sleep(24 * 60 * 60)  # 24 hours
-            logger.info("Running scheduled Gmail watch renewal")
-            await renew_all_watches()
-            pruned = await prune_old_messages(keep_days=7)
-            logger.info("Pruned %d old processed-message records", pruned)
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.error("Watch renewal loop error: %s", e)
-
-
-# â”€â”€ Health Check â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-@app.get("/health")
-async def health_check():
-    """Health check endpoint."""
-    return {
-        "status": "healthy",
-        "active_connections": manager.active_count,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-
-
-
-
-=== FILE: backend_server\config.py ===
-"""
-SOAR Backend â€” Centralized Configuration
-
-All tunable parameters in one place. Environment variables
-override defaults when set.
-"""
-
-import os
-from pathlib import Path
-
-# â”€â”€ Paths â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-BASE_DIR = Path(__file__).resolve().parent
-MODELS_DIR = BASE_DIR / "models"
-WEIGHTS_DIR = MODELS_DIR / "weights"
-SANDBOX_DIR = BASE_DIR / "sandbox"
-BASELINES_DIR = SANDBOX_DIR / "baselines"
-REPORTING_DIR = BASE_DIR / "reporting"
-QUARANTINE_DIR = BASE_DIR / "quarantine"  # Isolated download folder
-DB_PATH = BASE_DIR / "campaign.db"
-
-# Ensure critical directories exist
-QUARANTINE_DIR.mkdir(exist_ok=True)
-WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
-BASELINES_DIR.mkdir(parents=True, exist_ok=True)
-
-# â”€â”€ Server â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-HOST = os.getenv("SOAR_HOST", "0.0.0.0")
-PORT = int(os.getenv("PORT", os.getenv("SOAR_PORT", "8000")))
-
-# â”€â”€ Triage Thresholds â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-BLOCK_THRESHOLD = 0.95      # Score > this â†’ instant block at edge
-SANDBOX_THRESHOLD = 0.50    # Score > this but < BLOCK â†’ forward to sandbox
-ONNX_MODEL_PATH = WEIGHTS_DIR / "phishing_minilm.onnx"
-
-# â”€â”€ Sandbox â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-SANDBOX_TIMEOUT_MS = 30_000          # Max page load time
-SANDBOX_USE_DOCKER = os.getenv("SOAR_USE_DOCKER", "false").lower() == "true"
-DOCKER_IMAGE = "mcr.microsoft.com/playwright:v1.48.0-jammy"
-
-# â”€â”€ Brand Detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# Hamming distance threshold: lower = stricter match
-BRAND_HASH_THRESHOLD = 12
-
-# â”€â”€ Campaign Aggregation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-CAMPAIGN_REPORT_THRESHOLD = 20  # Instances before auto-generating CERT-In report
-
-# â”€â”€ Gmail OAuth / Pub/Sub â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-GMAIL_CLIENT_SECRETS_FILE = os.getenv(
-    "GMAIL_CLIENT_SECRETS", str(BASE_DIR / "client_secret.json")
-)
-# gmail.modify allows auto-labeling detected phishing emails in the user's mailbox
-GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
-# âš ï¸ REPLACE with your actual GCP project ID after creating the Pub/Sub topic
-GMAIL_PUBSUB_TOPIC = os.getenv(
-    "GMAIL_PUBSUB_TOPIC",
-    "projects/anti-phishingml/topics/gmail-phishing-alerts",
-)
-
-# Allow HTTP for local OAuth testing (remove in production with HTTPS)
-if os.getenv("OAUTHLIB_INSECURE_TRANSPORT") is None:
-    os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
-
-# â”€â”€ Top 30 Phishing Targets (bounded Levenshtein whitelist) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# Restricted to avoid O(m*n) explosion on every triage request
-BRAND_DOMAINS = [
-    "microsoft.com", "google.com", "apple.com", "amazon.com",
-    "paypal.com", "netflix.com", "facebook.com", "instagram.com",
-    "linkedin.com", "twitter.com", "dropbox.com", "adobe.com",
-    "chase.com", "wellsfargo.com", "bankofamerica.com", "citibank.com",
-    "hsbc.com", "barclays.com", "americanexpress.com", "usbank.com",
-    "sbi.co.in", "hdfcbank.com", "icicibank.com", "axisbank.com",
-    "yahoo.com", "outlook.com", "icloud.com", "github.com",
-    "steam.com", "ebay.com",
-]
-
-# Length-delta pre-filter: skip Levenshtein if domain lengths differ by more than this
-LEVENSHTEIN_LENGTH_DELTA = 3
-LEVENSHTEIN_THRESHOLD = 3  # Max edit distance to flag as typosquat
-
-
-
-
-=== FILE: backend_server\gmail\oauth_routes.py ===
+﻿=== FILE: backend_server\gmail\oauth_routes.py ===
 """
 SOAR Backend â€” Android Auth Route (serverAuthCode exchange)
 
@@ -713,30 +115,10 @@ async def authenticate_android_user(payload: AndroidAuthPayload):
     }
 
 
-
-
 === FILE: backend_server\gmail\webhook_handler.py ===
-"""
-SOAR Backend â€” Gmail Pub/Sub Webhook & Email Processor
-
-POST /webhook/gmail  â† called by Google Cloud Pub/Sub (push subscription)
-
-How it works:
-  1. Pub/Sub sends a POST with a base64 envelope containing { emailAddress, historyId }.
-  2. We immediately return 200 OK (Pub/Sub retries on anything else).
-  3. A background task uses the historyId delta to fetch only the *new*
-     messages via users.history.list â€” no polling, no full-sync.
-  4. Each new email is decoded from raw RFC 5322, URLs are extracted,
-     and the existing triage + email analysis pipeline is invoked.
-
-Gotcha handling:
-  â€¢ Duplicate messages:  checked against processed_messages table (at-least-once).
-  â€¢ Expired historyId:   404 from History API â†’ reset cursor from getProfile().
-  â€¢ Token refresh:       automatic via google-auth when creds.expired == True.
-"""
-
 from __future__ import annotations
 
+from uuid import uuid4
 import base64
 import json
 import logging
@@ -759,10 +141,30 @@ from gmail.user_store import (
     is_message_processed,
     mark_message_processed,
 )
-from models import EmailScanPayload, TriagePayload
+from models import EmailScanPayload, PhishingEvent, TriagePayload
 from models.email_analyzer import analyze_email, extract_urls_from_email
 from models.feature_extractor import extract_domain
 from campaign_db import record_incident
+
+"""
+SOAR Backend â€” Gmail Pub/Sub Webhook & Email Processor
+
+POST /webhook/gmail  â† called by Google Cloud Pub/Sub (push subscription)
+
+How it works:
+  1. Pub/Sub sends a POST with a base64 envelope containing { emailAddress, historyId }.
+  2. We immediately return 200 OK (Pub/Sub retries on anything else).
+  3. A background task uses the historyId delta to fetch only the *new*
+     messages via users.history.list â€” no polling, no full-sync.
+  4. Each new email is decoded from raw RFC 5322, URLs are extracted,
+     and the existing triage + email analysis pipeline is invoked.
+
+Gotcha handling:
+  â€¢ Duplicate messages:  checked against processed_messages table (at-least-once).
+  â€¢ Expired historyId:   404 from History API â†’ reset cursor from getProfile().
+  â€¢ Token refresh:       automatic via google-auth when creds.expired == True.
+"""
+
 
 logger = logging.getLogger("soar.gmail.webhook")
 
@@ -1008,6 +410,18 @@ async def _process_single_message(service, email_address: str, msg_id: str):
                 if domain:
                     await record_incident(domain, "gmail-webhook")
 
+        # Broadcast live alert to connected Flutter WebSocket clients
+        from main import manager
+        event = PhishingEvent(
+            id=f"gmail-{uuid4().hex[:12]}",
+            url=f"email://{sender_email}",
+            risk_score=result.confidence,
+            is_phishing=result.verdict == "phishing",
+            source_ip="gmail-webhook",
+            peer_node=email_address,
+        )
+        await manager.broadcast(event)
+
 
 # â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -1029,15 +443,7 @@ def _extract_display_name(from_header: str) -> str:
     return ""
 
 
-
-
 === FILE: soar_client\lib\services\api_service.dart ===
-/// HTTP API service for Tier 3 reporting and general backend calls.
-///
-/// Handles fetching CERT-In compliant reports and submitting
-/// intelligence packages to the FastAPI backend.
-library;
-
 import 'dart:convert';
 import 'package:http/http.dart' as http;
 import '../models/soar_models.dart';
@@ -1046,13 +452,20 @@ class ApiService {
   /// Base URL of the FastAPI backend.
   final String baseUrl;
 
-  ApiService({this.baseUrl = 'http://10.0.2.2:8000'});
+  ApiService({this.baseUrl = 'https://mangle-fading-deploy.ngrok-free.dev'});
+
+  static const Map<String, String> _ngrokHeaders = {
+    'ngrok-skip-browser-warning': '1',
+  };
 
   /// Fetch list of generated intelligence reports.
   Future<List<IntelReport>> fetchReports() async {
     final response = await http.get(
       Uri.parse('$baseUrl/api/v1/reports'),
-      headers: {'Accept': 'application/json'},
+      headers: {
+        'Accept': 'application/json',
+        ..._ngrokHeaders,
+      },
     );
 
     if (response.statusCode == 200) {
@@ -1068,7 +481,10 @@ class ApiService {
   Future<bool> submitReport(String reportId) async {
     final response = await http.post(
       Uri.parse('$baseUrl/api/v1/reports/$reportId/submit'),
-      headers: {'Content-Type': 'application/json'},
+      headers: {
+        'Content-Type': 'application/json',
+        ..._ngrokHeaders,
+      },
     );
     return response.statusCode == 200 || response.statusCode == 201;
   }
@@ -1077,6 +493,7 @@ class ApiService {
   Future<List<int>> downloadReportPdf(String reportId) async {
     final response = await http.get(
       Uri.parse('$baseUrl/api/v1/reports/$reportId/pdf'),
+      headers: _ngrokHeaders,
     );
     if (response.statusCode == 200) {
       return response.bodyBytes;
@@ -1084,93 +501,6 @@ class ApiService {
     throw Exception('Failed to download report: ${response.statusCode}');
   }
 }
-
-
-
-
-=== FILE: soar_client\lib\services\websocket_service.dart ===
-/// WebSocket service for Tier 1 real-time triage dashboard.
-///
-/// Maintains a persistent connection to the FastAPI backend,
-/// streaming live phishing block events and peer network updates
-/// without stalling the main UI thread.
-library;
-
-import 'dart:async';
-import 'dart:convert';
-import 'package:web_socket_channel/web_socket_channel.dart';
-import '../models/soar_models.dart';
-
-class WebSocketService {
-  WebSocketChannel? _channel;
-  final StreamController<PhishingEvent> _eventController =
-      StreamController<PhishingEvent>.broadcast();
-  final StreamController<bool> _connectionController =
-      StreamController<bool>.broadcast();
-
-  Timer? _reconnectTimer;
-  bool _disposed = false;
-
-  /// The backend WebSocket endpoint.
-  final String wsUrl;
-
-  WebSocketService({this.wsUrl = 'ws://10.0.2.2:8000/ws/triage'});
-
-  /// Exposed stream of live phishing events.
-  Stream<PhishingEvent> get events => _eventController.stream;
-
-  /// Connection status stream: true = connected.
-  Stream<bool> get connectionStatus => _connectionController.stream;
-
-  /// Initiate WebSocket connection.
-  void connect() {
-    if (_disposed) return;
-    try {
-      _channel = WebSocketChannel.connect(Uri.parse(wsUrl));
-      _connectionController.add(true);
-
-      _channel!.stream.listen(
-        (message) {
-          try {
-            final data = jsonDecode(message as String) as Map<String, dynamic>;
-            final event = PhishingEvent.fromJson(data);
-            _eventController.add(event);
-          } catch (_) {
-            // Malformed message â€” silently drop
-          }
-        },
-        onDone: () {
-          _connectionController.add(false);
-          _scheduleReconnect();
-        },
-        onError: (_) {
-          _connectionController.add(false);
-          _scheduleReconnect();
-        },
-      );
-    } catch (_) {
-      _connectionController.add(false);
-      _scheduleReconnect();
-    }
-  }
-
-  void _scheduleReconnect() {
-    if (_disposed) return;
-    _reconnectTimer?.cancel();
-    _reconnectTimer = Timer(const Duration(seconds: 5), connect);
-  }
-
-  /// Close the WebSocket connection and release resources.
-  void dispose() {
-    _disposed = true;
-    _reconnectTimer?.cancel();
-    _channel?.sink.close();
-    _eventController.close();
-    _connectionController.close();
-  }
-}
-
-
 
 
 === FILE: soar_client\lib\services\gmail_auth_service.dart ===
@@ -1194,16 +524,14 @@ import 'dart:convert';
 import 'package:google_sign_in/google_sign_in.dart';
 import 'package:http/http.dart' as http;
 
-/// Configuration â€” update these before building
 class GmailAuthConfig {
   /// The **Web Application** OAuth Client ID from Google Cloud Console.
   /// NOT the Android Client ID â€” Google requires the Web ID for serverAuthCode.
   static const String webClientId =
       '1089603468965-cna69vf6su8nmvp7112siooa36j6e7g9.apps.googleusercontent.com';
 
-  /// Backend base URL â€” your active localtunnel/ngrok URL
-  /// âš ï¸ Update this if your tunnel restarts
-  static const String backendBaseUrl = 'https://soar-phishing-backend.loca.lt';
+  /// Backend base URL â€” your permanent static ngrok domain
+  static const String backendBaseUrl = 'https://mangle-fading-deploy.ngrok-free.dev';
 }
 
 /// Result of a Gmail authentication attempt.
@@ -1320,5 +648,764 @@ class GmailAuthService {
 }
 
 
+=== FILE: soar_client\lib\services\websocket_service.dart ===
+/// WebSocket service for Tier 1 real-time triage dashboard.
+///
+/// Maintains a persistent connection to the FastAPI backend,
+/// streaming live phishing block events and peer network updates
+/// without stalling the main UI thread.
+library;
+
+import 'dart:async';
+import 'dart:convert';
+import 'package:web_socket_channel/web_socket_channel.dart';
+import '../models/soar_models.dart';
+
+class WebSocketService {
+  WebSocketChannel? _channel;
+  final StreamController<PhishingEvent> _eventController =
+      StreamController<PhishingEvent>.broadcast();
+  final StreamController<bool> _connectionController =
+      StreamController<bool>.broadcast();
+
+  Timer? _reconnectTimer;
+  bool _disposed = false;
+
+  /// The backend WebSocket endpoint.
+  final String wsUrl;
+
+  WebSocketService({
+    this.wsUrl = 'wss://mangle-fading-deploy.ngrok-free.dev/ws/triage',
+  });
+
+  /// Exposed stream of live phishing events.
+  Stream<PhishingEvent> get events => _eventController.stream;
+
+  /// Connection status stream: true = connected.
+  Stream<bool> get connectionStatus => _connectionController.stream;
+
+  /// Initiate WebSocket connection.
+  void connect() {
+    if (_disposed) return;
+    try {
+      _channel = WebSocketChannel.connect(Uri.parse(wsUrl));
+      _connectionController.add(true);
+
+      _channel!.stream.listen(
+        (message) {
+          try {
+            final data = jsonDecode(message as String) as Map<String, dynamic>;
+            final event = PhishingEvent.fromJson(data);
+            _eventController.add(event);
+          } catch (_) {
+            // Malformed message â€” silently drop
+          }
+        },
+        onDone: () {
+          _connectionController.add(false);
+          _scheduleReconnect();
+        },
+        onError: (_) {
+          _connectionController.add(false);
+          _scheduleReconnect();
+        },
+      );
+    } catch (_) {
+      _connectionController.add(false);
+      _scheduleReconnect();
+    }
+  }
+
+  void _scheduleReconnect() {
+    if (_disposed) return;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = Timer(const Duration(seconds: 5), connect);
+  }
+
+  /// Close the WebSocket connection and release resources.
+  void dispose() {
+    _disposed = true;
+    _reconnectTimer?.cancel();
+    _channel?.sink.close();
+    _eventController.close();
+    _connectionController.close();
+  }
+}
+
+
+=== FILE: soar_client\lib\screens\gmail_screen.dart ===
+/// SOAR Client â€” Gmail Protection Screen (Tier 0)
+///
+/// The entry point for users to connect their Gmail account to
+/// the real-time SOAR phishing pipeline. Hosts the [GmailConnectCard]
+/// and explains how the system works in-app.
+library;
+
+import 'package:flutter/material.dart';
+import '../theme/soar_theme.dart';
+import '../widgets/gmail_connect_card.dart';
+import '../widgets/shared_widgets.dart';
+
+class GmailScreen extends StatelessWidget {
+  const GmailScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: SoarTheme.bg,
+      body: SafeArea(
+        child: CustomScrollView(
+          slivers: [
+            // â”€â”€ App Bar â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            SliverAppBar(
+              pinned: true,
+              backgroundColor: SoarTheme.bg,
+              expandedHeight: 80,
+              flexibleSpace: FlexibleSpaceBar(
+                titlePadding:
+                    const EdgeInsets.only(left: 20, bottom: 14),
+                title: Row(
+                  children: [
+                    Container(
+                      width: 28,
+                      height: 28,
+                      decoration: BoxDecoration(
+                        color: SoarTheme.accentCyanDim,
+                        borderRadius:
+                            BorderRadius.circular(SoarTheme.radiusSm),
+                      ),
+                      child: const Icon(Icons.email_rounded,
+                          color: SoarTheme.accentCyan, size: 16),
+                    ),
+                    const SizedBox(width: 10),
+                    Text('Gmail Monitor',
+                        style: SoarTheme.heading2.copyWith(fontSize: 17)),
+                  ],
+                ),
+              ),
+            ),
+
+            // â”€â”€ Body â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            SliverPadding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+              sliver: SliverList(
+                delegate: SliverChildListDelegate([
+
+                  // Connect card â€” the main action
+                  const GmailConnectCard(),
+
+                  const SizedBox(height: 24),
+
+                  // How it works section
+                  const SectionHeader(title: 'HOW IT WORKS'),
+                  const SizedBox(height: 12),
+                  _HowItWorksCard(),
+
+                  const SizedBox(height: 24),
+
+                  // What we detect section
+                  const SectionHeader(title: 'WHAT WE DETECT'),
+                  const SizedBox(height: 12),
+                  _DetectionGrid(),
+
+                  const SizedBox(height: 24),
+
+                  // Privacy note
+                  _PrivacyNote(),
+                ]),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// â”€â”€ How It Works Card â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class _HowItWorksCard extends StatelessWidget {
+  final _steps = const [
+    (
+      icon: Icons.login_rounded,
+      color: SoarTheme.accentCyan,
+      title: 'Sign in with Google',
+      desc: 'One tap â€” your credentials never leave your device.',
+    ),
+    (
+      icon: Icons.notifications_active_outlined,
+      color: SoarTheme.warning,
+      title: 'Gmail notifies our server',
+      desc: 'Google Cloud Pub/Sub pushes a tiny notification (no email body) within 1-3 seconds of a new email.',
+    ),
+    (
+      icon: Icons.psychology_outlined,
+      color: SoarTheme.success,
+      title: 'ML pipeline runs',
+      desc: 'The backend fetches only the raw email, extracts URLs, and runs the phishing detection model.',
+    ),
+    (
+      icon: Icons.shield_rounded,
+      color: SoarTheme.danger,
+      title: 'Phishing emails get labelled',
+      desc: 'Detected phishing emails are auto-labelled "[PHISHING]" in your Gmail and reported as IOCs.',
+    ),
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: BoxDecoration(
+        color: SoarTheme.surfaceAlt,
+        borderRadius: BorderRadius.circular(SoarTheme.radiusLg),
+        border: Border.all(color: SoarTheme.border),
+      ),
+      child: Column(
+        children: [
+          for (int i = 0; i < _steps.length; i++) ...[
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Container(
+                    width: 32,
+                    height: 32,
+                    decoration: BoxDecoration(
+                      color: _steps[i].color.withValues(alpha: 0.12),
+                      borderRadius:
+                          BorderRadius.circular(SoarTheme.radiusSm),
+                    ),
+                    child: Icon(_steps[i].icon,
+                        color: _steps[i].color, size: 16),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text('${i + 1}. ${_steps[i].title}',
+                            style: SoarTheme.heading3
+                                .copyWith(fontSize: 13)),
+                        const SizedBox(height: 3),
+                        Text(_steps[i].desc,
+                            style: SoarTheme.body.copyWith(fontSize: 12)),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            if (i < _steps.length - 1)
+              const Divider(
+                  height: 1, color: SoarTheme.border, indent: 60),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+// â”€â”€ Detection Grid â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class _DetectionGrid extends StatelessWidget {
+  final _threats = const [
+    (icon: Icons.link_off_rounded,   label: 'Malicious URLs'),
+    (icon: Icons.person_off_rounded, label: 'Sender Spoofing'),
+    (icon: Icons.timer_outlined,     label: 'Urgency Tactics'),
+    (icon: Icons.swap_horiz_rounded, label: 'Hidden Link Mismatch'),
+    (icon: Icons.attach_file_rounded, label: 'Dangerous Attachments'),
+    (icon: Icons.dns_outlined,       label: 'Typosquat Domains'),
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    return GridView.count(
+      crossAxisCount: 2,
+      shrinkWrap: true,
+      physics: const NeverScrollableScrollPhysics(),
+      mainAxisSpacing: 8,
+      crossAxisSpacing: 8,
+      childAspectRatio: 2.8,
+      children: [
+        for (final t in _threats)
+          Container(
+            padding:
+                const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            decoration: BoxDecoration(
+              color: SoarTheme.surfaceAlt,
+              borderRadius:
+                  BorderRadius.circular(SoarTheme.radiusMd),
+              border: Border.all(color: SoarTheme.border),
+            ),
+            child: Row(
+              children: [
+                Icon(t.icon,
+                    color: SoarTheme.accentCyan, size: 14),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(t.label,
+                      style: SoarTheme.caption.copyWith(
+                          color: SoarTheme.textSecondary,
+                          fontSize: 11),
+                      maxLines: 2),
+                ),
+              ],
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+// â”€â”€ Privacy Note â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class _PrivacyNote extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: SoarTheme.surface,
+        borderRadius: BorderRadius.circular(SoarTheme.radiusMd),
+        border: Border.all(
+            color: SoarTheme.accentCyan.withValues(alpha: 0.15)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Icon(Icons.lock_outline_rounded,
+              color: SoarTheme.accentCyan, size: 15),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              'Privacy: Google only sends us a tiny notification cursor (historyId). '
+              'Your email content is fetched server-side only when a new email arrives, '
+              'and is never stored â€” only its URLs are scanned.',
+              style: SoarTheme.caption.copyWith(
+                  color: SoarTheme.textMuted,
+                  fontWeight: FontWeight.w400,
+                  height: 1.5),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+
+=== FILE: soar_client\lib\widgets\gmail_connect_card.dart ===
+/// SOAR Client â€” Gmail Connect Widget
+///
+/// A self-contained card that handles the full Google Sign-In flow:
+///   â€¢ Idle state: animated gradient "Connect Gmail Protection" button
+///   â€¢ Loading state: spinner with status text
+///   â€¢ Connected state: green badge with the user's email + disconnect option
+///   â€¢ Error state: inline error with retry
+///
+/// Uses the existing [GmailAuthService] â€” no extra state management needed.
+library;
+
+import 'dart:async';
+import 'package:flutter/material.dart';
+import '../services/gmail_auth_service.dart';
+import '../theme/soar_theme.dart';
+
+/// Drop-in widget â€” place it anywhere in the widget tree.
+class GmailConnectCard extends StatefulWidget {
+  const GmailConnectCard({super.key});
+
+  @override
+  State<GmailConnectCard> createState() => _GmailConnectCardState();
+}
+
+class _GmailConnectCardState extends State<GmailConnectCard>
+    with SingleTickerProviderStateMixin {
+  final GmailAuthService _authService = GmailAuthService();
+
+  _UiState _state = _UiState.idle;
+  String? _email;
+  String? _errorMsg;
+
+  // Subtle pulse animation on the connect button
+  late final AnimationController _pulseController;
+  late final Animation<double> _pulseAnim;
+
+  @override
+  void initState() {
+    super.initState();
+    _pulseController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 2000),
+    )..repeat(reverse: true);
+    _pulseAnim = Tween<double>(begin: 0.85, end: 1.0).animate(
+      CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
+    );
+    _checkExistingSession();
+  }
+
+  @override
+  void dispose() {
+    _pulseController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _checkExistingSession() async {
+    final signedIn = await _authService.isSignedIn();
+    if (signedIn && _authService.connectedEmail != null && mounted) {
+      setState(() {
+        _state = _UiState.connected;
+        _email = _authService.connectedEmail;
+      });
+    }
+  }
+
+  Future<void> _handleConnect() async {
+    setState(() {
+      _state = _UiState.loading;
+      _errorMsg = null;
+    });
+
+    final result = await _authService.connectGmail();
+
+    if (!mounted) return;
+
+    if (result.success) {
+      setState(() {
+        _state = _UiState.connected;
+        _email = result.email;
+      });
+      _showSnack('âœ… Gmail monitoring active for ${result.email}', success: true);
+    } else {
+      setState(() {
+        _state = _UiState.error;
+        _errorMsg = result.error;
+      });
+    }
+  }
+
+  Future<void> _handleDisconnect() async {
+    await _authService.disconnectGmail();
+    if (mounted) {
+      setState(() {
+        _state = _UiState.idle;
+        _email = null;
+        _errorMsg = null;
+      });
+    }
+  }
+
+  void _showSnack(String msg, {bool success = false}) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(msg,
+            style: const TextStyle(color: SoarTheme.textPrimary, fontSize: 13)),
+        backgroundColor:
+            success ? SoarTheme.successDim : SoarTheme.dangerDim,
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(SoarTheme.radiusSm)),
+        margin: const EdgeInsets.all(12),
+        duration: const Duration(seconds: 4),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: SoarTheme.surfaceAlt,
+        borderRadius: BorderRadius.circular(SoarTheme.radiusLg),
+        border: Border.all(
+          color: _state == _UiState.connected
+              ? SoarTheme.success.withValues(alpha: 0.4)
+              : SoarTheme.border,
+          width: 1,
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _buildHeader(),
+          const SizedBox(height: 12),
+          _buildDescription(),
+          const SizedBox(height: 20),
+          _buildScopeRow(),
+          const SizedBox(height: 20),
+          _buildActionArea(),
+          if (_state == _UiState.error && _errorMsg != null) ...[
+            const SizedBox(height: 12),
+            _buildErrorBanner(),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildHeader() {
+    final (icon, color, label) = switch (_state) {
+      _UiState.connected => (Icons.shield_rounded, SoarTheme.success, 'Protected'),
+      _UiState.loading   => (Icons.sync_rounded, SoarTheme.accentCyan, 'Connecting...'),
+      _UiState.error     => (Icons.warning_amber_rounded, SoarTheme.warning, 'Error'),
+      _UiState.idle      => (Icons.shield_outlined, SoarTheme.textMuted, 'Not Connected'),
+    };
+
+    return Row(
+      children: [
+        Icon(icon, color: color, size: 20),
+        const SizedBox(width: 10),
+        Text('Gmail Phishing Protection',
+            style: SoarTheme.heading3.copyWith(fontSize: 16)),
+        const Spacer(),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+          decoration: BoxDecoration(
+            color: color.withValues(alpha: 0.12),
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(color: color.withValues(alpha: 0.3)),
+          ),
+          child: Text(label,
+              style: SoarTheme.caption.copyWith(color: color, fontSize: 11)),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildDescription() {
+    final text = _state == _UiState.connected
+        ? 'Monitoring $_email in real-time. New phishing emails will be detected and reported within seconds.'
+        : 'Connect your Gmail to scan incoming emails for phishing URLs in real-time via Google Cloud Pub/Sub.';
+
+    return Text(text, style: SoarTheme.body.copyWith(fontSize: 13));
+  }
+
+  Widget _buildScopeRow() {
+    return Row(
+      children: [
+        _ScopeChip(
+          icon: Icons.mark_email_read_outlined,
+          label: 'gmail.modify',
+          tooltip: 'Read emails + apply phishing labels',
+        ),
+        const SizedBox(width: 8),
+        _ScopeChip(
+          icon: Icons.notifications_active_outlined,
+          label: 'Real-time push',
+          tooltip: 'Google Cloud Pub/Sub webhook',
+        ),
+      ],
+    );
+  }
+
+  Widget _buildActionArea() {
+    return switch (_state) {
+      _UiState.idle      => _buildConnectButton(),
+      _UiState.loading   => _buildLoadingIndicator(),
+      _UiState.connected => _buildConnectedRow(),
+      _UiState.error     => _buildConnectButton(),
+    };
+  }
+
+  Widget _buildConnectButton() {
+    return AnimatedBuilder(
+      animation: _pulseAnim,
+      builder: (_, _) => Transform.scale(
+        scale: _pulseAnim.value,
+        child: SizedBox(
+          width: double.infinity,
+          height: 48,
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              gradient: const LinearGradient(
+                colors: [Color(0xFF06B6D4), Color(0xFF0EA5E9)],
+                begin: Alignment.centerLeft,
+                end: Alignment.centerRight,
+              ),
+              borderRadius: BorderRadius.circular(SoarTheme.radiusMd),
+              boxShadow: [
+                BoxShadow(
+                  color: SoarTheme.accentCyan.withValues(alpha: 0.3),
+                  blurRadius: 12,
+                  offset: const Offset(0, 4),
+                ),
+              ],
+            ),
+            child: Material(
+              color: Colors.transparent,
+              child: InkWell(
+                onTap: _handleConnect,
+                borderRadius: BorderRadius.circular(SoarTheme.radiusMd),
+                child: const Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(Icons.shield_rounded, color: Colors.white, size: 18),
+                    SizedBox(width: 8),
+                    Text(
+                      'Connect Gmail Protection',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.w600,
+                        fontSize: 14,
+                        letterSpacing: 0.3,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildLoadingIndicator() {
+    return const SizedBox(
+      height: 48,
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          SizedBox(
+            width: 18,
+            height: 18,
+            child: CircularProgressIndicator(
+              strokeWidth: 2,
+              valueColor: AlwaysStoppedAnimation(SoarTheme.accentCyan),
+            ),
+          ),
+          SizedBox(width: 12),
+          Text('Authenticating with Google...',
+              style: TextStyle(
+                color: SoarTheme.textSecondary,
+                fontSize: 13,
+                fontWeight: FontWeight.w500,
+              )),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildConnectedRow() {
+    return Row(
+      children: [
+        Expanded(
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            decoration: BoxDecoration(
+              color: SoarTheme.successDim.withValues(alpha: 0.5),
+              borderRadius: BorderRadius.circular(SoarTheme.radiusMd),
+              border: Border.all(
+                  color: SoarTheme.success.withValues(alpha: 0.2)),
+            ),
+            child: Row(
+              children: [
+                const Icon(Icons.check_circle_outline,
+                    color: SoarTheme.success, size: 16),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    _email ?? 'Connected',
+                    style: SoarTheme.body.copyWith(
+                      color: SoarTheme.success,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w500,
+                    ),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(width: 8),
+        IconButton(
+          onPressed: _handleDisconnect,
+          icon: const Icon(Icons.logout_rounded,
+              color: SoarTheme.textMuted, size: 18),
+          tooltip: 'Disconnect',
+          style: IconButton.styleFrom(
+            backgroundColor: SoarTheme.surface,
+            shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(SoarTheme.radiusSm)),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildErrorBanner() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: SoarTheme.dangerDim.withValues(alpha: 0.5),
+        borderRadius: BorderRadius.circular(SoarTheme.radiusSm),
+        border: Border.all(color: SoarTheme.danger.withValues(alpha: 0.3)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Icon(Icons.error_outline,
+              color: SoarTheme.danger, size: 15),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              _errorMsg!,
+              style: SoarTheme.caption.copyWith(
+                color: SoarTheme.danger,
+                fontWeight: FontWeight.w400,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+enum _UiState { idle, loading, connected, error }
+
+class _ScopeChip extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final String tooltip;
+
+  const _ScopeChip({
+    required this.icon,
+    required this.label,
+    required this.tooltip,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: tooltip,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+        decoration: BoxDecoration(
+          color: SoarTheme.surface,
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(color: SoarTheme.border),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 11, color: SoarTheme.accentCyan),
+            const SizedBox(width: 4),
+            Text(label,
+                style: SoarTheme.caption.copyWith(
+                    fontSize: 10, color: SoarTheme.textSecondary)),
+          ],
+        ),
+      ),
+    );
+  }
+}
 
 

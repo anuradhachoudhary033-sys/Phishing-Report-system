@@ -121,6 +121,16 @@ async def process_mailbox_changes(email_address: str, new_history_id: str):
     Fetch new messages since our last stored historyId, parse each one
     through the full SOAR email analysis pipeline, and broadcast results.
     """
+    try:
+        await _process_mailbox_changes_inner(email_address, new_history_id)
+    except Exception as e:
+        logger.error(
+            "Unhandled exception in process_mailbox_changes for %s: %s",
+            email_address, e, exc_info=True
+        )
+
+
+async def _process_mailbox_changes_inner(email_address: str, new_history_id: str):
     user = await get_user(email_address)
     if not user:
         logger.warning("Webhook for unknown user %s — ignoring", email_address)
@@ -292,17 +302,22 @@ async def _process_single_message(service, email_address: str, msg_id: str):
                 if domain:
                     await record_incident(domain, "gmail-webhook")
 
-        # Broadcast live alert to connected Flutter WebSocket clients
-        from main import manager
-        event = PhishingEvent(
-            id=f"gmail-{uuid4().hex[:12]}",
-            url=f"email://{sender_email}",
-            risk_score=result.confidence,
-            is_phishing=result.verdict == "phishing",
-            source_ip="gmail-webhook",
-            peer_node=email_address,
-        )
-        await manager.broadcast(event)
+    # Broadcast live alert to ALL connected Flutter WebSocket clients
+    # (all verdicts shown — phishing/suspicious/safe — so the feed is always live)
+    from main import manager
+    event = PhishingEvent(
+        id=f"gmail-{uuid4().hex[:12]}",
+        url=f"email://{sender_email}",
+        risk_score=result.confidence,
+        is_phishing=result.verdict == "phishing",
+        source_ip="gmail-webhook",
+        peer_node=email_address,
+    )
+    await manager.broadcast(event)
+    logger.info(
+        "📡 Broadcast to WebSocket clients: verdict=%s confidence=%.2f from=%s",
+        result.verdict, result.confidence, sender_email
+    )
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────

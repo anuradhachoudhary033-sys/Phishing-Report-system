@@ -99,15 +99,26 @@ class GmailAuthService {
       // Step 2: Send auth code to backend
       final response = await http.post(
         Uri.parse('${GmailAuthConfig.backendBaseUrl}/auth/google'),
-        headers: {'Content-Type': 'application/json'},
+        headers: {
+          'Content-Type': 'application/json',
+          'ngrok-skip-browser-warning': '1',
+        },
         body: jsonEncode({'auth_code': serverAuthCode}),
       );
 
       if (response.statusCode != 200) {
-        final errorBody = jsonDecode(response.body);
+        String errorDetail = 'Backend returned ${response.statusCode}';
+        try {
+          final errorBody = jsonDecode(response.body);
+          if (errorBody is Map && errorBody['detail'] != null) {
+            errorDetail = errorBody['detail'].toString();
+          }
+        } catch (_) {
+          // Response was not JSON (e.g., tunnel or 500 error)
+        }
         return GmailAuthResult(
           success: false,
-          error: errorBody['detail'] ?? 'Backend returned ${response.statusCode}',
+          error: errorDetail,
         );
       }
 
