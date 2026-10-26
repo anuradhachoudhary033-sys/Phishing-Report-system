@@ -1,3 +1,5 @@
+torch
+spaces
 fastapi
 uvicorn[standard]
 pydantic
@@ -14,3 +16,4 @@ google-auth-oauthlib
 google-auth-httplib2
 beautifulsoup4
 httpx
+gradio

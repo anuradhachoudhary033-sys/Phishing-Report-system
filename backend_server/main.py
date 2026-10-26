@@ -47,6 +47,7 @@ from campaign_db import (
 )
 from gmail.oauth_routes import router as gmail_oauth_router
 from gmail.webhook_handler import router as gmail_webhook_router
+from gmail.inbox_routes import router as gmail_inbox_router
 from gmail.user_store import init_gmail_db, prune_old_messages
 from gmail.watch_renewal import renew_all_watches
 
@@ -123,6 +124,7 @@ app = FastAPI(
 # ── Register Gmail routers ──────────────────────────────────────────────
 app.include_router(gmail_oauth_router)
 app.include_router(gmail_webhook_router)
+app.include_router(gmail_inbox_router)
 
 # ── CORS (allow prototype UI + ngrok tunnel to reach API) ────────────
 app.add_middleware(
@@ -434,9 +436,13 @@ async def triage_websocket(ws: WebSocket):
     await manager.connect(ws)
     try:
         while True:
-            # Accept incoming messages (triage requests from clients)
+            # Accept incoming messages (triage requests from clients or keepalive pings)
             data = await ws.receive_text()
             try:
+                if '"ping"' in data or data.strip() == "ping":
+                    await ws.send_text('{"pong":true}')
+                    continue
+
                 payload = TriagePayload.model_validate_json(data)
                 result = await score_url(payload)
 

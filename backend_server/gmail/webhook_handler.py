@@ -269,6 +269,9 @@ async def _process_single_message(service, email_address: str, msg_id: str):
     headers = {}
     if reply_to:
         headers["reply-to"] = reply_to
+    auth_results = parsed.get_all("Authentication-Results") or []
+    if auth_results:
+        headers["authentication-results"] = " ; ".join(str(h) for h in auth_results)
 
     # Construct the EmailScanPayload and run through existing pipeline
     scan_payload = EmailScanPayload(
