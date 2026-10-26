@@ -48,11 +48,16 @@ CAMPAIGN_REPORT_THRESHOLD = 20  # Instances before auto-generating CERT-In repor
 GMAIL_CLIENT_SECRETS_FILE = os.getenv(
     "GMAIL_CLIENT_SECRETS", str(BASE_DIR / "client_secret.json")
 )
-# Auto-create client_secret.json on Hugging Face from Space Secret
-if not Path(GMAIL_CLIENT_SECRETS_FILE).exists() and os.getenv("CLIENT_SECRET_JSON"):
-    Path(GMAIL_CLIENT_SECRETS_FILE).write_text(
-        os.environ["CLIENT_SECRET_JSON"], encoding="utf-8"
-    )
+# Auto-create or sync client_secret.json on Render / Cloud from environment secret
+client_secret_env = os.getenv("CLIENT_SECRET_JSON")
+if client_secret_env:
+    try:
+        secret_path = Path(GMAIL_CLIENT_SECRETS_FILE)
+        clean_content = client_secret_env.strip()
+        if not secret_path.exists() or secret_path.read_text(encoding="utf-8").strip() != clean_content:
+            secret_path.write_text(clean_content, encoding="utf-8")
+    except Exception as e:
+        print(f"[config] Warning: Failed to write CLIENT_SECRET_JSON: {e}")
 # gmail.modify allows auto-labeling detected phishing emails in the user's mailbox
 GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
 # ⚠️ REPLACE with your actual GCP project ID after creating the Pub/Sub topic

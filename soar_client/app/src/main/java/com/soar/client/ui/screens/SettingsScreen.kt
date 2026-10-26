@@ -217,6 +217,19 @@ fun SettingsScreen(
                             }
                         }
 
+                        Spacer(modifier = Modifier.height(6.dp))
+
+                        OutlinedButton(
+                            onClick = {
+                                backendUrlInput = "https://soar-phishing-backend.onrender.com"
+                                urlSavedStatus = false
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Text("☁️ Render Cloud (soar-phishing-backend)", fontSize = 11.sp, maxLines = 1)
+                        }
+
                         Spacer(modifier = Modifier.height(10.dp))
 
                         Button(

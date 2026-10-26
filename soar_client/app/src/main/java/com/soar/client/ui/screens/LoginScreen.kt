@@ -292,6 +292,19 @@ fun LoginScreen(
                                 Text("Emulator (10.0.2.2)", fontSize = 11.sp, maxLines = 1)
                             }
                         }
+                        Spacer(modifier = Modifier.height(6.dp))
+                        OutlinedButton(
+                            onClick = {
+                                val cloudUrl = "https://soar-phishing-backend.onrender.com"
+                                backendUrlInput = cloudUrl
+                                (context.applicationContext as? SoarApplication)?.updateBackendUrl(cloudUrl)
+                                authViewModel.setBackendUrl(cloudUrl)
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Text("☁️ Render Cloud (soar-phishing-backend)", fontSize = 11.sp, maxLines = 1)
+                        }
                     }
                 }
             }
