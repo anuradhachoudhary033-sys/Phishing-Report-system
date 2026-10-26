@@ -1,12 +1,16 @@
 package com.soar.client.ui.screens
 
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.ui.res.painterResource
+import com.soar.client.R
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -76,19 +80,19 @@ fun LoginScreen(
             verticalArrangement = Arrangement.Center,
             modifier = Modifier.fillMaxWidth()
         ) {
-            // App Shield Emblem
+            // App Brand Logo Emblem
             Box(
                 modifier = Modifier
-                    .size(72.dp)
-                    .clip(CircleShape)
-                    .background(SoarCyanDim),
+                    .size(88.dp)
+                    .clip(RoundedCornerShape(24.dp))
+                    .background(Color.White.copy(alpha = 0.04f))
+                    .border(1.dp, Color.White.copy(alpha = 0.10f), RoundedCornerShape(24.dp)),
                 contentAlignment = Alignment.Center
             ) {
-                Icon(
-                    imageVector = Icons.Default.Security,
-                    contentDescription = "SOAR Logo",
-                    tint = SoarCyan,
-                    modifier = Modifier.size(40.dp)
+                Image(
+                    painter = painterResource(id = R.drawable.app_logo),
+                    contentDescription = "SOAR Mail Logo",
+                    modifier = Modifier.size(72.dp)
                 )
             }
 
