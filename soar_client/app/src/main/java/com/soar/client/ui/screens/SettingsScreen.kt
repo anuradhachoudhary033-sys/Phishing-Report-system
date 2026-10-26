@@ -221,13 +221,13 @@ fun SettingsScreen(
 
                         OutlinedButton(
                             onClick = {
-                                backendUrlInput = "https://soar-phishing-backend.onrender.com"
+                                backendUrlInput = "https://phishing-report-system.onrender.com"
                                 urlSavedStatus = false
                             },
                             modifier = Modifier.fillMaxWidth(),
                             shape = RoundedCornerShape(10.dp)
                         ) {
-                            Text("☁️ Render Cloud (soar-phishing-backend)", fontSize = 11.sp, maxLines = 1)
+                            Text("☁️ Render Cloud (phishing-report-system)", fontSize = 11.sp, maxLines = 1)
                         }
 
                         Spacer(modifier = Modifier.height(10.dp))

@@ -295,7 +295,7 @@ fun LoginScreen(
                         Spacer(modifier = Modifier.height(6.dp))
                         OutlinedButton(
                             onClick = {
-                                val cloudUrl = "https://soar-phishing-backend.onrender.com"
+                                val cloudUrl = "https://phishing-report-system.onrender.com"
                                 backendUrlInput = cloudUrl
                                 (context.applicationContext as? SoarApplication)?.updateBackendUrl(cloudUrl)
                                 authViewModel.setBackendUrl(cloudUrl)
@@ -303,7 +303,7 @@ fun LoginScreen(
                             modifier = Modifier.fillMaxWidth(),
                             shape = RoundedCornerShape(10.dp)
                         ) {
-                            Text("☁️ Render Cloud (soar-phishing-backend)", fontSize = 11.sp, maxLines = 1)
+                            Text("☁️ Render Cloud (phishing-report-system)", fontSize = 11.sp, maxLines = 1)
                         }
                     }
                 }

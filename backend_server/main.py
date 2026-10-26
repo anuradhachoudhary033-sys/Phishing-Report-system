@@ -140,6 +140,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.get("/")
+async def root():
+    """Root health and service status."""
+    return {
+        "status": "online",
+        "service": "SOAR Phishing Defense API",
+        "docs": "/docs",
+        "health": "/health",
+    }
+
 # ── Layer 1: Triage API ─────────────────────────────────────────────────
 
 @app.post("/api/v1/triage")

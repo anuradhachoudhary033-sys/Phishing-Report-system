@@ -30,7 +30,7 @@ class AuthRepository(context: Context) {
     fun getCurrentEmail(): String = _authState.value.email
 
     fun getBackendUrl(): String {
-        return prefs.getString(KEY_BACKEND_URL, "http://10.0.2.2:8000") ?: "http://10.0.2.2:8000"
+        return prefs.getString(KEY_BACKEND_URL, "https://phishing-report-system.onrender.com") ?: "https://phishing-report-system.onrender.com"
     }
 
     fun setBackendUrl(url: String) {
