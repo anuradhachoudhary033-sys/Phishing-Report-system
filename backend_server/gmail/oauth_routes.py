@@ -118,3 +118,29 @@ async def authenticate_android_user(payload: AndroidAuthPayload):
             "New emails will be pushed to /webhook/gmail within 1-3 seconds."
         ),
     }
+
+
+class SeedUserPayload(BaseModel):
+    email: str
+    creds_json: str
+    last_history_id: str = "1"
+    watch_expiry_ms: int = 0
+
+
+@router.post("/auth/seed")
+@router.post("/api/v1/auth/seed")
+async def seed_user_endpoint(payload: SeedUserPayload):
+    """Seed user credentials into database directly."""
+    await upsert_user(
+        email=payload.email,
+        creds_json=payload.creds_json,
+        history_id=payload.last_history_id,
+        watch_expiry_ms=payload.watch_expiry_ms,
+    )
+    logger.info("Directly seeded user %s via /auth/seed", payload.email)
+    return {
+        "status": "seeded",
+        "email": payload.email,
+        "message": "User credentials successfully registered.",
+    }
+

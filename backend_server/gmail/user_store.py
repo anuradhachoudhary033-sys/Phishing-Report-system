@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 
 import aiosqlite
@@ -49,6 +50,23 @@ async def init_gmail_db() -> None:
         await db.executescript(_INIT_SQL)
         await db.commit()
     logger.info("Gmail user store ready  (%s)", _DB_PATH)
+
+    # Auto-seed credentials from environment variable if present (for cloud deployments like Render)
+    seed_env = os.getenv("GMAIL_USER_SEED_JSON")
+    if seed_env:
+        try:
+            data = json.loads(seed_env)
+            users = data if isinstance(data, list) else [data]
+            for u in users:
+                await upsert_user(
+                    email=u["email"],
+                    creds_json=u["creds_json"] if isinstance(u["creds_json"], str) else json.dumps(u["creds_json"]),
+                    history_id=str(u.get("last_history_id", "1")),
+                    watch_expiry_ms=int(u.get("watch_expiry_ms", 0)),
+                )
+            logger.info("Auto-seeded %d user(s) into Gmail store from environment", len(users))
+        except Exception as e:
+            logger.error("Failed to seed users from GMAIL_USER_SEED_JSON: %s", e)
 
 
 # ── CRUD ─────────────────────────────────────────────────────────────────
