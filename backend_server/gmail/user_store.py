@@ -97,8 +97,9 @@ async def get_user(email: str) -> dict | None:
     """Return user record dict or None."""
     async with aiosqlite.connect(str(_DB_PATH)) as db:
         db.row_factory = aiosqlite.Row
+        clean_email = email.strip() if email else ""
         cursor = await db.execute(
-            "SELECT * FROM gmail_users WHERE email = ?", (email,)
+            "SELECT * FROM gmail_users WHERE LOWER(TRIM(email)) = LOWER(TRIM(?))", (clean_email,)
         )
         row = await cursor.fetchone()
         if row is None:

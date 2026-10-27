@@ -580,23 +580,43 @@ async def send_email(payload: SendEmailPayload):
 
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii")
     body: dict = {"raw": raw}
-    if payload.thread_id:
-        body["threadId"] = payload.thread_id
+    if payload.thread_id and payload.thread_id.strip():
+        body["threadId"] = payload.thread_id.strip()
 
+    sent = None
     try:
         sent = service.users().messages().send(userId="me", body=body).execute()
     except HttpError as e:
-        if e.resp is not None and e.resp.status in (401, 403):
-            logger.info("Got %s from Gmail send for %s, refreshing token and retrying...", e.resp.status, payload.email)
-            service = await _get_service(payload.email, force_refresh=True)
+        # 1. If threadId was rejected as invalid, strip it and retry sending as a clean thread
+        if "thread" in str(e).lower() and "threadId" in body:
+            logger.warning("Thread ID %s invalid for %s, retrying without threadId...", payload.thread_id, payload.email)
+            body.pop("threadId", None)
             try:
                 sent = service.users().messages().send(userId="me", body=body).execute()
-            except HttpError as e2:
-                logger.error("Gmail retry send failed for %s: %s", payload.email, e2)
-                raise HTTPException(status_code=502, detail=f"Gmail send failed: {e2}")
-        else:
-            logger.error("Gmail send failed for %s: %s", payload.email, e)
-            raise HTTPException(status_code=502, detail=f"Gmail send failed: {e}")
+            except HttpError as e_thread:
+                e = e_thread
+
+        # 2. If token expired or auth error (401/403), force refresh and retry once
+        if sent is None:
+            if e.resp is not None and e.resp.status in (401, 403):
+                logger.info("Got %s from Gmail send for %s, refreshing token and retrying...", e.resp.status, payload.email)
+                service = await _get_service(payload.email, force_refresh=True)
+                try:
+                    sent = service.users().messages().send(userId="me", body=body).execute()
+                except HttpError as e2:
+                    logger.error("Gmail retry send failed for %s: %s", payload.email, e2)
+                    status = e2.resp.status if e2.resp is not None else 502
+                    raise HTTPException(
+                        status_code=status if 400 <= status < 500 else 502,
+                        detail=f"Gmail send failed: {e2}",
+                    )
+            else:
+                logger.error("Gmail send failed for %s: %s", payload.email, e)
+                status = e.resp.status if e.resp is not None else 502
+                raise HTTPException(
+                    status_code=status if 400 <= status < 500 else 502,
+                    detail=f"Gmail send failed: {e}",
+                )
 
     logger.info(
         "Sent msg %s from %s to %d recipient(s)",
