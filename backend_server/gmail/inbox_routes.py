@@ -152,7 +152,7 @@ def _parse_mime(raw_bytes: bytes) -> dict:
 
 # -- Credential helper -----------------------------------------------------
 
-async def _get_service(email: str):
+async def _get_service(email: str, force_refresh: bool = False):
     """
     Load stored credentials for *email*, refresh if expired, and return
     an authenticated Gmail service client.
@@ -171,10 +171,13 @@ async def _get_service(email: str):
     creds = Credentials.from_authorized_user_info(
         json.loads(user["creds_json"]), GMAIL_SCOPES
     )
-    if creds.expired and creds.refresh_token:
-        creds.refresh(GoogleAuthRequest())
-        await update_creds(email, creds.to_json())
-        logger.info("Auto-refreshed token for %s", email)
+    if (creds.expired or force_refresh or not creds.valid) and creds.refresh_token:
+        try:
+            creds.refresh(GoogleAuthRequest())
+            await update_creds(email, creds.to_json())
+            logger.info("Refreshed OAuth token for %s", email)
+        except Exception as e:
+            logger.warning("Token refresh warning for %s: %s", email, e)
 
     return build("gmail", "v1", credentials=creds)
 
@@ -208,8 +211,17 @@ async def list_inbox(
     try:
         list_resp = service.users().messages().list(**list_kwargs).execute()
     except HttpError as e:
-        logger.error("Gmail list error for %s (%s): %s", email, target_label, e)
-        raise HTTPException(status_code=502, detail=f"Gmail API error: {e}")
+        if e.resp is not None and e.resp.status in (401, 403):
+            logger.info("Got %s from Gmail list for %s, refreshing token and retrying...", e.resp.status, email)
+            service = await _get_service(email, force_refresh=True)
+            try:
+                list_resp = service.users().messages().list(**list_kwargs).execute()
+            except HttpError as e2:
+                logger.error("Gmail list retry error for %s (%s): %s", email, target_label, e2)
+                raise HTTPException(status_code=502, detail=f"Gmail API error: {e2}")
+        else:
+            logger.error("Gmail list error for %s (%s): %s", email, target_label, e)
+            raise HTTPException(status_code=502, detail=f"Gmail API error: {e}")
 
     messages_meta = list_resp.get("messages", [])
     next_page = list_resp.get("nextPageToken")
@@ -370,9 +382,24 @@ async def get_email_detail(
             .execute()
         )
     except HttpError as e:
-        if e.resp.status == 404:
+        if e.resp is not None and e.resp.status in (401, 403):
+            logger.info("Got %s fetching email %s for %s, refreshing token and retrying...", e.resp.status, msg_id, email)
+            service = await _get_service(email, force_refresh=True)
+            try:
+                raw_msg = (
+                    service.users()
+                    .messages()
+                    .get(userId="me", id=msg_id, format="raw")
+                    .execute()
+                )
+            except HttpError as e2:
+                if e2.resp is not None and e2.resp.status == 404:
+                    raise HTTPException(status_code=404, detail=f"Message {msg_id} not found")
+                raise HTTPException(status_code=502, detail=f"Gmail API error: {e2}")
+        elif e.resp is not None and e.resp.status == 404:
             raise HTTPException(status_code=404, detail=f"Message {msg_id} not found")
-        raise HTTPException(status_code=502, detail=f"Gmail API error: {e}")
+        else:
+            raise HTTPException(status_code=502, detail=f"Gmail API error: {e}")
 
     raw_bytes = base64.urlsafe_b64decode(raw_msg["raw"])
     parsed = _parse_mime(raw_bytes)
@@ -436,9 +463,20 @@ async def trash_email(
         service.users().messages().trash(userId="me", id=msg_id).execute()
         logger.info("Moved msg %s to Trash for %s", msg_id, email)
     except HttpError as e:
-        if e.resp.status == 404:
+        if e.resp is not None and e.resp.status in (401, 403):
+            logger.info("Got %s trashing email %s for %s, refreshing token and retrying...", e.resp.status, msg_id, email)
+            service = await _get_service(email, force_refresh=True)
+            try:
+                service.users().messages().trash(userId="me", id=msg_id).execute()
+                logger.info("Moved msg %s to Trash for %s on retry", msg_id, email)
+            except HttpError as e2:
+                if e2.resp is not None and e2.resp.status == 404:
+                    raise HTTPException(status_code=404, detail=f"Message {msg_id} not found")
+                raise HTTPException(status_code=502, detail=f"Gmail trash failed: {e2}")
+        elif e.resp is not None and e.resp.status == 404:
             raise HTTPException(status_code=404, detail=f"Message {msg_id} not found")
-        raise HTTPException(status_code=502, detail=f"Gmail trash failed: {e}")
+        else:
+            raise HTTPException(status_code=502, detail=f"Gmail trash failed: {e}")
 
     return {
         "status": "trashed",
@@ -548,14 +586,17 @@ async def send_email(payload: SendEmailPayload):
     try:
         sent = service.users().messages().send(userId="me", body=body).execute()
     except HttpError as e:
-        logger.error("Gmail send failed for %s: %s", payload.email, e)
-        status = e.resp.status if e.resp is not None else 502
-        if status == 403:
-            raise HTTPException(
-                status_code=403,
-                detail="Gmail refused to send -- the account may need to re-grant permissions.",
-            )
-        raise HTTPException(status_code=502, detail=f"Gmail send failed: {e}")
+        if e.resp is not None and e.resp.status in (401, 403):
+            logger.info("Got %s from Gmail send for %s, refreshing token and retrying...", e.resp.status, payload.email)
+            service = await _get_service(payload.email, force_refresh=True)
+            try:
+                sent = service.users().messages().send(userId="me", body=body).execute()
+            except HttpError as e2:
+                logger.error("Gmail retry send failed for %s: %s", payload.email, e2)
+                raise HTTPException(status_code=502, detail=f"Gmail send failed: {e2}")
+        else:
+            logger.error("Gmail send failed for %s: %s", payload.email, e)
+            raise HTTPException(status_code=502, detail=f"Gmail send failed: {e}")
 
     logger.info(
         "Sent msg %s from %s to %d recipient(s)",
