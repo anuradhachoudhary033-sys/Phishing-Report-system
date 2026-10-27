@@ -10,8 +10,10 @@ import com.soar.client.data.remote.SendEmailResponse
 import com.soar.client.data.remote.SoarApiService
 import com.soar.client.data.util.HtmlTextCleaner
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 
 /**
  * Offline-first repository for emails.
@@ -206,40 +208,80 @@ class EmailRepository(
 
     /**
      * Compose & send email. Also caches sent message immediately into Room DB.
+     * Automatically retries once if cloud server is waking up from sleep (502 / timeout).
      */
     suspend fun sendEmail(payload: SendEmailPayload): Result<SendEmailResponse> = withContext(Dispatchers.IO) {
-        try {
-            val resp = apiService.sendEmail(payload)
-            if (resp.status == "sent" || resp.msgId != null) {
-                val sentMsgId = resp.msgId ?: "sent_${System.currentTimeMillis()}"
-                val sentEntity = EmailEntity(
-                    msgId = sentMsgId,
-                    threadId = resp.threadId ?: payload.threadId ?: "",
-                    senderEmail = payload.email,
-                    senderDisplay = "Me",
-                    recipient = payload.to.joinToString(", "),
-                    subject = payload.subject.ifBlank { "(No Subject)" },
-                    date = "Just now",
-                    snippet = payload.body.take(120),
-                    isUnread = false,
-                    hasAttachment = payload.attachments.isNotEmpty(),
-                    attachmentCount = payload.attachments.size,
-                    verdict = "safe",
-                    confidence = 1.0f,
-                    threatCount = 0,
-                    urlsExtracted = 0,
-                    isAutoBlocked = false,
-                    bodyText = payload.body,
-                    bodyHtml = "",
-                    folder = "SENT",
-                    sortOrder = System.currentTimeMillis()
-                )
-                dao.insert(sentEntity)
+        var lastException: Exception? = null
+        for (attempt in 1..2) {
+            try {
+                val resp = apiService.sendEmail(payload)
+                if (resp.status == "sent" || resp.msgId != null) {
+                    val sentMsgId = resp.msgId ?: "sent_${System.currentTimeMillis()}"
+                    val sentEntity = EmailEntity(
+                        msgId = sentMsgId,
+                        threadId = resp.threadId ?: payload.threadId ?: "",
+                        senderEmail = payload.email,
+                        senderDisplay = "Me",
+                        recipient = payload.to.joinToString(", "),
+                        subject = payload.subject.ifBlank { "(No Subject)" },
+                        date = "Just now",
+                        snippet = payload.body.take(120),
+                        isUnread = false,
+                        hasAttachment = payload.attachments.isNotEmpty(),
+                        attachmentCount = payload.attachments.size,
+                        verdict = "safe",
+                        confidence = 1.0f,
+                        threatCount = 0,
+                        urlsExtracted = 0,
+                        isAutoBlocked = false,
+                        bodyText = payload.body,
+                        bodyHtml = "",
+                        folder = "SENT",
+                        sortOrder = System.currentTimeMillis()
+                    )
+                    dao.insert(sentEntity)
+                }
+                return@withContext Result.success(resp)
+            } catch (e: Exception) {
+                lastException = e
+                Log.w("EmailRepository", "Send attempt $attempt failed: ${e.message}")
+                val isServerError = (e as? retrofit2.HttpException)?.code() in listOf(502, 503, 504)
+                val isTimeout = e is java.io.IOException
+                if (attempt == 1 && (isServerError || isTimeout)) {
+                    Log.i("EmailRepository", "Server waking up or timed out; waiting 2.5s and retrying...")
+                    delay(2500)
+                    continue
+                }
+                break
             }
-            Result.success(resp)
-        } catch (e: Exception) {
-            Result.failure(e)
         }
+        val cleanMsg = extractFriendlyMessage(lastException)
+        Result.failure(Exception(cleanMsg, lastException))
+    }
+
+    private fun extractFriendlyMessage(e: Exception?): String {
+        if (e == null) return "Send failed"
+        if (e is retrofit2.HttpException) {
+            try {
+                val errorBody = e.response()?.errorBody()?.string()
+                if (!errorBody.isNullOrBlank()) {
+                    val json = JSONObject(errorBody)
+                    if (json.has("detail")) {
+                        return json.getString("detail")
+                    }
+                }
+            } catch (_: Exception) { }
+            return when (e.code()) {
+                502, 503, 504 -> "Cloud server is waking up. Please tap Send again in a few seconds."
+                401, 403 -> "Authentication required. Please reconnect Google account."
+                422 -> "Invalid recipient address or email fields."
+                else -> "Server error (${e.code()}): ${e.message()}"
+            }
+        }
+        if (e is java.io.IOException) {
+            return "Connection timeout. Cloud server is waking up, please tap Send again."
+        }
+        return e.message ?: "Send failed"
     }
 
     private fun InboxMessageDto.toEntity(sortOrder: Long, folder: String = "INBOX"): EmailEntity {

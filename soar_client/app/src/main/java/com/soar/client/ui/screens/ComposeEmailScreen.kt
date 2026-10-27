@@ -240,11 +240,20 @@ fun ComposeEmailScreen(
                 verticalArrangement = Arrangement.spacedBy(14.dp)
             ) {
                 if (errorMessage != null) {
-                    Text(
-                        text = errorMessage!!,
-                        color = Color(0xFFF43F5E),
-                        style = MaterialTheme.typography.bodySmall
-                    )
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(Color(0xFF2D1216))
+                            .border(1.dp, Color(0xFFF43F5E).copy(alpha = 0.5f), RoundedCornerShape(8.dp))
+                            .padding(horizontal = 12.dp, vertical = 10.dp)
+                    ) {
+                        Text(
+                            text = errorMessage!!,
+                            color = Color(0xFFFFB4BA),
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
                 }
 
                 OutlinedTextField(
