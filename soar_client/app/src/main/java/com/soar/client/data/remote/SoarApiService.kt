@@ -16,7 +16,7 @@ interface SoarApiService {
     @GET("api/v1/inbox")
     suspend fun getInbox(
         @Query("email") email: String,
-        @Query("max_results") maxResults: Int = 100,
+        @Query("max_results") maxResults: Int = 25,
         @Query("page_token") pageToken: String? = null,
         @Query("label") label: String = "INBOX"
     ): InboxResponse

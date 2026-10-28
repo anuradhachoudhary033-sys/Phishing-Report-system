@@ -80,9 +80,9 @@ class InboxViewModel(
     )
 
     init {
-        // Automatically pre-warm both INBOX and SENT from Room DB and trigger background sync concurrently
+        // Sync active INBOX on launch. Sent messages are cached in Room DB and sync on-demand
+        // when the user navigates to the Outbox/Sent folder to stay well within Gmail API rate limits.
         refreshInbox()
-        syncSent()
     }
 
     fun setFolder(folder: String) {

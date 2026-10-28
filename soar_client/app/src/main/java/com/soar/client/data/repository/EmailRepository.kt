@@ -58,9 +58,9 @@ class EmailRepository(
      * Background sync: Downloads the 100 most recent emails.
      * Caches them in Room DB, separating clean emails from auto-blocked phishing emails.
      */
-    suspend fun syncRecent100Emails(email: String): Result<Int> = withContext(Dispatchers.IO) {
+    suspend fun syncRecent100Emails(email: String, maxResults: Int = 25): Result<Int> = withContext(Dispatchers.IO) {
         try {
-            val response = apiService.getInbox(email = email, maxResults = 100, pageToken = null, label = "INBOX")
+            val response = apiService.getInbox(email = email, maxResults = maxResults, pageToken = null, label = "INBOX")
             nextPageToken = response.nextPageToken
 
             var order = response.messages.size.toLong()
@@ -72,15 +72,15 @@ class EmailRepository(
             Log.i("EmailRepository", "Synced ${entities.size} recent emails into local Room cache")
             Result.success(entities.size)
         } catch (e: Exception) {
-            Log.e("EmailRepository", "Error syncing 100 recent emails: ${e.message}")
+            Log.e("EmailRepository", "Error syncing recent emails: ${e.message}")
             Result.failure(e)
         }
     }
 
     /**
-     * Background sync: Downloads 100 most recent Sent / Outbox messages.
+     * Background sync: Downloads recent Sent / Outbox messages.
      */
-    suspend fun syncRecentSentEmails(email: String, maxResults: Int = 100): Result<Int> = withContext(Dispatchers.IO) {
+    suspend fun syncRecentSentEmails(email: String, maxResults: Int = 25): Result<Int> = withContext(Dispatchers.IO) {
         try {
             val response = apiService.getInbox(email = email, maxResults = maxResults, pageToken = null, label = "SENT")
             sentNextPageToken = response.nextPageToken
@@ -265,15 +265,23 @@ class EmailRepository(
             try {
                 val errorBody = e.response()?.errorBody()?.string()
                 if (!errorBody.isNullOrBlank()) {
+                    if (errorBody.contains("rateLimitExceeded", ignoreCase = true) || errorBody.contains("quota", ignoreCase = true)) {
+                        return "Gmail rate limit reached (Units per minute per user). Please wait 30 seconds before sending."
+                    }
                     val json = JSONObject(errorBody)
                     if (json.has("detail")) {
-                        return json.getString("detail")
+                        val detail = json.getString("detail")
+                        if (detail.contains("rateLimitExceeded", ignoreCase = true) || detail.contains("quota", ignoreCase = true)) {
+                            return "Gmail rate limit reached (Units per minute per user). Please wait 30 seconds before sending."
+                        }
+                        return detail
                     }
                 }
             } catch (_: Exception) { }
             return when (e.code()) {
+                429 -> "Gmail rate limit reached. Please wait 30 seconds before sending."
                 502, 503, 504 -> "Cloud server is waking up. Please tap Send again in a few seconds."
-                401, 403 -> "Authentication required. Please reconnect Google account."
+                401, 403 -> "Gmail rate limit or authorization error. Please wait 30 seconds."
                 422 -> "Invalid recipient address or email fields."
                 else -> "Server error (${e.code()}): ${e.message()}"
             }

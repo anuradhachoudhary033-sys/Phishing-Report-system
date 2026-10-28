@@ -594,7 +594,10 @@ fun MainScreen(
                     },
                     onEmailSent = {
                         closeCompose()
-                        inboxViewModel.syncSent()
+                        scope.launch {
+                            delay(2000)
+                            inboxViewModel.syncSent()
+                        }
                     }
                 )
             }

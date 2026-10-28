@@ -211,8 +211,16 @@ async def list_inbox(
     try:
         list_resp = service.users().messages().list(**list_kwargs).execute()
     except HttpError as e:
-        if e.resp is not None and e.resp.status in (401, 403):
-            logger.info("Got %s from Gmail list for %s, refreshing token and retrying...", e.resp.status, email)
+        if "ratelimitexceeded" in str(e).lower() or "quota" in str(e).lower():
+            logger.warning("Gmail list rate limit hit for %s, waiting 2.0s...", email)
+            await asyncio.sleep(2.0)
+            try:
+                list_resp = service.users().messages().list(**list_kwargs).execute()
+            except HttpError as e_quota:
+                logger.error("Gmail list retry error for %s: %s", email, e_quota)
+                raise HTTPException(status_code=429, detail="Gmail rate limit exceeded. Please wait a moment.")
+        elif e.resp is not None and e.resp.status == 401:
+            logger.info("Got 401 from Gmail list for %s, refreshing token and retrying...", email)
             service = await _get_service(email, force_refresh=True)
             try:
                 list_resp = service.users().messages().list(**list_kwargs).execute()
@@ -221,7 +229,8 @@ async def list_inbox(
                 raise HTTPException(status_code=502, detail=f"Gmail API error: {e2}")
         else:
             logger.error("Gmail list error for %s (%s): %s", email, target_label, e)
-            raise HTTPException(status_code=502, detail=f"Gmail API error: {e}")
+            status = e.resp.status if e.resp is not None else 502
+            raise HTTPException(status_code=status if 400 <= status < 500 else 502, detail=f"Gmail API error: {e}")
 
     messages_meta = list_resp.get("messages", [])
     next_page = list_resp.get("nextPageToken")
@@ -596,10 +605,24 @@ async def send_email(payload: SendEmailPayload):
             except HttpError as e_thread:
                 e = e_thread
 
-        # 2. If token expired or auth error (401/403), force refresh and retry once
+        # 2. Check if rate limited / quota exceeded -> wait 3.0s and retry once
+        err_str = str(e).lower()
+        if sent is None and ("ratelimitexceeded" in err_str or "quota" in err_str or (e.resp and e.resp.status == 403 and "usagelimits" in err_str)):
+            logger.warning("Gmail rate limit/quota hit for %s, waiting 3.0s and retrying send...", payload.email)
+            await asyncio.sleep(3.0)
+            try:
+                sent = service.users().messages().send(userId="me", body=body).execute()
+            except HttpError as e_quota:
+                logger.error("Gmail retry after rate limit failed for %s: %s", payload.email, e_quota)
+                raise HTTPException(
+                    status_code=429,
+                    detail="Gmail API rate limit reached (Units per minute per user). Please wait 30 seconds before sending.",
+                )
+
+        # 3. If token expired (401), force refresh and retry once
         if sent is None:
-            if e.resp is not None and e.resp.status in (401, 403):
-                logger.info("Got %s from Gmail send for %s, refreshing token and retrying...", e.resp.status, payload.email)
+            if e.resp is not None and e.resp.status == 401:
+                logger.info("Got 401 from Gmail send for %s, refreshing token and retrying...", payload.email)
                 service = await _get_service(payload.email, force_refresh=True)
                 try:
                     sent = service.users().messages().send(userId="me", body=body).execute()
